@@ -1,4 +1,4 @@
-flask
-flask-socketio
-gunicorn
-eventlet
+gunicorn==21.2.0
+eventlet==0.36.1
+flask==3.0.3
+flask-socketio==5.3.6
