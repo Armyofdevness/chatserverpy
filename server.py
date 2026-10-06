@@ -7,8 +7,8 @@ Dependencies:
     pip install flask flask-socketio eventlet
 """
 
-#import eventlet
-#eventlet.monkey_patch()
+import eventlet
+eventlet.monkey_patch()
 import collections
 import json
 import os
