@@ -5,17 +5,34 @@ Run:  python server.py
 
 Dependencies:
     pip install flask flask-socketio eventlet
+    (eventlet is optional: without it the server falls back to plain threads)
+
+Environment:
+    SECRET_KEY    Flask secret (change it in production)
+    FRONTEND_URL  Allowed CORS origin of the deployed front-end
+    BOT_SECRET    Optional. A client that sends this value as "botSecret" in its
+                  "join" is treated as a trusted bot: exempt from rate limits and
+                  allowed to use the reserved bot nicks. Unset = no such clients.
 """
 
-import eventlet
-eventlet.monkey_patch()
+try:
+    import eventlet
+    eventlet.monkey_patch()      # must run before the other imports below
+    ASYNC_MODE = "eventlet"
+except ImportError:              # eventlet not installed → plain threads
+    ASYNC_MODE = "threading"
+
 import collections
+import hmac
 import json
 import os
+import re
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, send_from_directory
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -27,18 +44,22 @@ HOST          = "0.0.0.0"
 PORT          = 5000
 SECRET_KEY    = os.environ.get("SECRET_KEY", "change-me-in-production")
 
-# IDs whose messages always bypass pairing logic (emitted as Solo panels).
-# Compared against msg["avatarId"] so it works regardless of display nick.
+# Avatar ids / display nicks of the built-in bots (BOT_CAST in data.js).
+# They are used for exactly two things:
+#   • panel routing — messages from these avatars/nicks are always Solo panels
+#   • reserved nicks — a normal user cannot take these names
+# They grant NO privileges. NB: "chatbot" is also a normal, user-selectable
+# avatar, so it must never mean "trusted". Rate-limit exemption is reserved for
+# sessions that authenticated with BOT_SECRET (see below).
 BOT_AVATAR_IDS = frozenset({"cyberbot", "chatbot"})
+BOT_NICKS      = frozenset({"chatbot", "cyberbot"})   # case-insensitive
 
-# Display nicks that identify bot senders — secondary guard that catches
-# messages where avatarId is not one of the canonical bot IDs.
-# Must match the nick strings used in BOT_CAST in data.js (case-insensitive).
-BOT_NICKS = frozenset({"chatbot", "cyberbot"})
+# Shared secret for trusted bot clients (empty = feature off).
+BOT_SECRET = os.environ.get("BOT_SECRET", "")
 
-# Seconds within which a second human 'say' from a DIFFERENT nick triggers
-# a Retroactive Duo Upgrade instead of a new Solo panel.
-DUO_UPGRADE_WINDOW_SECS = 3.0
+# Seconds within which a human 'say' from a DIFFERENT nick upgrades the
+# in-progress panel (Solo→Duo, Duo→Trio) instead of starting a new Solo.
+PANEL_UPGRADE_WINDOW_SECS = 3.0
 
 # ── Rate-limiting — sliding window per sid ────────────────────────────────────
 #
@@ -57,7 +78,11 @@ DUO_UPGRADE_WINDOW_SECS = 3.0
 #     Commands are cheaper than chat (no history write, no panel upgrade),
 #     so they get a slightly more generous limit.
 #
-# Bots (BOT_AVATAR_IDS / BOT_NICKS) are always exempt from both limiters.
+# Only sessions that authenticated as a bot (BOT_SECRET) are exempt.
+#
+#   typing limiter
+#     Typing indicators are broadcast to the room on every keystroke burst,
+#     so they get their own generous per-sid cap (excess is dropped silently).
 #
 RATE_MSG_LIMIT  = 10    # hard cap: drop the message silently above this
 RATE_MSG_WARN   = 7     # soft cap: send a private warning above this
@@ -67,24 +92,49 @@ RATE_CMD_LIMIT  = 15    # hard cap for room_command events
 RATE_CMD_WARN   = 10    # soft cap for room_command events
 RATE_CMD_WINDOW = 5.0   # sliding window in seconds
 
+RATE_TYPING_LIMIT  = 60   # typing events per window
+RATE_TYPING_WINDOW = 5.0
+
+# ── Image / GIF prop (actionType "image") ────────────────────────────────────
+# Mirrored for friendly client-side errors in data.js (IMAGE_HOST_ALLOWLIST).
+# EXACT hostnames only — never substring / wildcard matching.
+IMAGE_HOST_ALLOWLIST = frozenset({
+    # Giphy
+    "media.giphy.com", "media0.giphy.com", "media1.giphy.com", "media2.giphy.com",
+    "media3.giphy.com", "media4.giphy.com", "i.giphy.com",
+    # Tenor (existing direct links only). media1.tenor.com is deliberately absent:
+    # those URLs return an HTML page, not an image.
+    "media.tenor.com", "c.tenor.com",
+})
+# NOT ENABLED — each needs the verification checklist from the feature handoff
+# first (terms allow hotlinking, plain <img> loads cross-origin, https only, stable
+# URLs, exact hostnames). Kept here only as a reminder; nothing reads this set.
+IMAGE_HOSTS_PENDING = frozenset({
+    # "klipy …"               — direct-media hostname NOT confirmed
+    # "upload.wikimedia.org"  — check Wikimedia's current hotlinking policy first
+})
+IMAGE_EXTENSIONS    = (".gif", ".webp", ".png", ".jpg", ".jpeg")
+IMAGE_URL_MAX_LEN   = 512
+
+IMG_POST_LIMIT       = 1      # posts per user …
+IMG_POST_WINDOW      = 30.0   # … per this many seconds
+IMG_MIN_DISPLAY_SECS = 20     # nobody else may replace an image for this long
+
 # Per-sid deques: { sid: deque([timestamp, ...]) }
 # Written / read only inside the rate-limit helper (protected by GIL for CPython;
 # a dedicated lock is added for safety under eventlet green-threads).
 _rate_msg: dict[str, collections.deque] = {}
 _rate_cmd: dict[str, collections.deque] = {}
+_rate_typing: dict[str, collections.deque] = {}
+_rate_img: dict[str, collections.deque] = {}
 _rate_lock = threading.Lock()
 
 # ── App & Socket init ─────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder=".", static_url_path="")
 app.config["SECRET_KEY"] = SECRET_KEY
 
-# async_mode="eventlet" gives full WebSocket support.
-# Falls back to "threading" if eventlet isn't installed.
-try:
-    import eventlet
-    ASYNC_MODE = "eventlet"
-except ImportError:
-    ASYNC_MODE = "threading"
+# async_mode="eventlet" gives full WebSocket support; ASYNC_MODE falls back to
+# "threading" (see the imports at the top) when eventlet isn't installed.
 
 # Replace with your actual Netlify app URL once you have it
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://argensoftchat.netlify.app")
@@ -92,7 +142,14 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://argensoftchat.netlify.app
 socketio = SocketIO(
     app,
     async_mode=ASYNC_MODE,
-    cors_allowed_origins=[FRONTEND_URL, "http://localhost:5000", "http://127.0.0.1:5000"],
+    cors_allowed_origins=[
+        FRONTEND_URL,
+        "http://localhost:5000", "http://127.0.0.1:5000",
+        # local dev: pages served by VS Code Live Server / python -m http.server
+        "http://localhost:5500", "http://127.0.0.1:5500",
+        "http://localhost:8000", "http://127.0.0.1:8000",
+        "http://localhost:8080", "http://127.0.0.1:8080",
+    ],
     ping_timeout=60,
     ping_interval=25,
     logger=False,
@@ -104,6 +161,8 @@ _history_lock = threading.Lock()
 
 # ── Online users: {sid: {nick, avatarId, room}} ───────────────────────────────
 online_users: dict[str, dict] = {}
+# Guards the check-then-register in on_join (nick uniqueness) under real threads.
+_users_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,9 +187,6 @@ online_users: dict[str, dict] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 _last_human_panel: dict[str, dict] = {}
 _panel_lock = threading.Lock()
-
-# Keep the old name as an alias so nothing else in the file breaks
-_solo_lock = _panel_lock
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,10 +254,6 @@ def _check_rate_limit(
             return "warn"
         return "ok"
 
-# Maximum upgrade window — reused for every step (Solo→Duo, Duo→Trio)
-PANEL_UPGRADE_WINDOW_SECS = 3.0
-# Keep old constant name for backward compat in case it's referenced elsewhere
-DUO_UPGRADE_WINDOW_SECS = PANEL_UPGRADE_WINDOW_SECS
 # ─────────────────────────────────────────────────────────────────────────────
 # Active event tracker — {room: initiator_nick}
 #
@@ -210,6 +262,57 @@ DUO_UPGRADE_WINDOW_SECS = PANEL_UPGRADE_WINDOW_SECS
 # the sender) and so late-joining clients could eventually be informed.
 # ─────────────────────────────────────────────────────────────────────────────
 _active_events: dict[str, str] = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image prop — {room: {"by": nick, "ts": epoch seconds}} of the latest post.
+# Drives the replace lock: a DIFFERENT user cannot replace an image within
+# IMG_MIN_DISPLAY_SECS of it being posted. Clearing is never blocked.
+# ─────────────────────────────────────────────────────────────────────────────
+_room_images: dict[str, dict] = {}
+_image_lock = threading.Lock()
+
+
+def _validate_image_url(url) -> "str | None":
+    """Return the NORMALISED image URL if it is acceptable, else None.
+
+    Rules: https only; hostname must be IN the allowlist exactly; no user-info;
+    port absent or 443; ASCII only, no whitespace / control characters / backslashes;
+    ≤ 512 chars; a real path ending in an image extension. Query strings are fine
+    (shared Giphy links carry them). This rejects "media.giphy.com.evil.net",
+    "media.giphy.com@evil.net", page links (no image extension) and video files.
+
+    What is returned is REBUILT from the validated parts, so the string that is
+    relayed to the clients is exactly the one that was checked (no parser
+    differences between Python and the browsers can smuggle another host through).
+    """
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url or len(url) > IMAGE_URL_MAX_LEN or not url.isascii():
+        return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url) or "\\" in url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port  = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or "@" in parts.netloc:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    if port not in (None, 443):
+        return None
+    host = parts.hostname                    # lower-cased by urlsplit
+    if host not in IMAGE_HOST_ALLOWLIST:
+        return None
+    if not parts.path or parts.path == "/" or not parts.path.lower().endswith(IMAGE_EXTENSIONS):
+        return None
+    return f"https://{host}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+
+
+def _is_allowed_image_url(url) -> bool:
+    return _validate_image_url(url) is not None
 _event_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -436,17 +539,21 @@ def on_connect():
 def on_disconnect():
     """Remove user from online roster and notify the room."""
     sid = _sid()
-    user = online_users.pop(sid, None)
+    with _users_lock:
+        user = online_users.pop(sid, None)
 
     # Always clean up rate-limit state for this sid, even if the user
     # was not fully joined (e.g. connected then disconnected immediately).
     with _rate_lock:
         _rate_msg.pop(sid, None)
         _rate_cmd.pop(sid, None)
+        _rate_typing.pop(sid, None)
+        _rate_img.pop(sid, None)
 
-    if user:
-        room = user.get("room", "general")
+    room = user.get("room") if user else None
+    if user and room:                      # room is None after an explicit "leave"
         leave_room(room)
+        _release_event(room, user["nick"])
         _broadcast_user_list(room)
         emit(
             "system_msg",
@@ -460,33 +567,51 @@ def on_disconnect():
 def on_join(data: dict):
     """
     Client sends:
-        { nick, avatarId, room }
+        { nick, avatarId, room, botSecret? }
 
     Server responds with:
-        - "history"     → last N messages for this room only
-        - "user_list"   → current online roster
+        - "nick_assigned" → only if the nick had to change (taken / reserved)
+        - "history"       → last N messages for this room only
+        - "user_list"     → current online roster
         - broadcasts "system_msg" to the room
-    """
-    nick      = _sanitise(data.get("nick", "Anonymous"), max_len=32)
-    avatar_id = _sanitise(data.get("avatarId", "kid"),   max_len=32)
-    room      = _sanitise(data.get("room", "general"),   max_len=32)
-    sid       = _sid()
 
-    # If the user was already in a different socket room, leave it cleanly.
-    # This handles room-switches that don't go through on_leave.
-    prev_room = online_users.get(sid, {}).get("room")
+    The nick registered here is the user's identity for the rest of the
+    connection: every later event is attributed to it, whatever the payload says.
+    """
+    data        = data if isinstance(data, dict) else {}
+    sid         = _sid()
+    desired     = _clean_nick(data.get("nick"))
+    avatar_id   = _clean_id(data.get("avatarId"), "kid")
+    room        = _clean_room(data.get("room"))
+    trusted_bot = _is_trusted_bot(data.get("botSecret"))
+
+    # Check-then-register must be atomic, or two simultaneous joins could both
+    # win the same nick.
+    with _users_lock:
+        prev      = online_users.get(sid)
+        prev_room = prev.get("room") if prev else None
+        prev_nick = prev["nick"] if prev else None
+        nick      = _unique_nick(room, desired, sid, trusted_bot)
+        online_users[sid] = {"nick": nick, "avatarId": avatar_id, "room": room, "bot": trusted_bot}
+
+    # Moving straight from another room (a client that did not send "leave"):
+    # leave it cleanly. After an explicit "leave", prev_room is None and the
+    # announcement was already made there.
     if prev_room and prev_room != room:
         leave_room(prev_room)
+        _release_event(prev_room, prev_nick)
         socketio.emit(
             "system_msg",
-            {"text": f"*** {nick} has left #{prev_room}"},
+            {"text": f"*** {prev_nick} has left #{prev_room}"},
             to=prev_room,
         )
         _broadcast_user_list(prev_room)
 
-    # Register user in new room
-    online_users[sid] = {"nick": nick, "avatarId": avatar_id, "room": room}
     join_room(room)
+
+    if nick != desired:
+        # Tell the client the name it really has, so it can update its own state.
+        emit("nick_assigned", {"nick": nick, "requested": desired})
 
     # Send only this room's history to the joining client
     all_history  = _load_history()
@@ -509,24 +634,32 @@ def on_join(data: dict):
         {"text": f"*** {nick} has joined #{room}"},
         to=room,
     )
-    print(f"[join] {nick} (avatar={avatar_id}) joined #{room}")
+    print(f"[join] {nick} (avatar={avatar_id}) joined #{room}"
+          + (f"  [asked for {desired!r}]" if nick != desired else "")
+          + ("  [trusted bot]" if trusted_bot else ""))
 
 
 @socketio.on("leave")
-def on_leave(data: dict):
+def on_leave(data=None):
     """
-    Client sends:  { nick, room }
     Emitted by websocket-patch.js when the user switches rooms via switchRoom().
+    The payload is ignored: the user leaves the room the SERVER has them in,
+    and the announcement uses their registered nick.
     """
     sid  = _sid()
-    user = online_users.get(sid, {})
-    nick = _sanitise(data.get("nick") or user.get("nick", "?"), max_len=32)
-    room = _sanitise(data.get("room") or user.get("room", "general"), max_len=32)
+    user = online_users.get(sid)
+    if not user or not user.get("room"):
+        return
+    room, nick = user["room"], user["nick"]
 
     leave_room(room)
+    _release_event(room, nick)
 
-    # Don't remove from online_users — a "join" for the new room follows immediately.
-    # Just announce and update the user list in the old room.
+    # Stay registered (a "join" for the new room follows immediately) but with
+    # no room: the old room's roster no longer lists them, messages sent in the
+    # gap are dropped, and on_join will not announce the departure a second time.
+    user["room"] = None
+
     emit(
         "system_msg",
         {"text": f"*** {nick} has left #{room}"},
@@ -567,30 +700,32 @@ def on_chat_message(data: dict):
                   every client replaces the existing panel in-place (same msgId).
                 → panel full (3 speakers) or same nick → start fresh Solo.
     """
-    sid  = _sid()
-    user = online_users.get(sid, {})
+    sid, user = _joined_user()
+    if user is None or not isinstance(data, dict):
+        return   # not in a room (never joined, or between leave and join)
 
-    nick      = _sanitise(data.get("nick",     user.get("nick", "?")),      max_len=32)
-    avatar_id = _sanitise(data.get("avatarId", user.get("avatarId", "kid")), max_len=32)
+    # WHO and WHERE come from the session registered at join — the payload's
+    # nick / room are ignored, so nobody can speak as someone else or post into
+    # a room they are not in. avatarId is the one cosmetic field the client may
+    # change mid-session (Change Character), so it is accepted but validated.
+    nick      = user["nick"]
+    room      = user["room"]
+    avatar_id = _clean_id(data.get("avatarId"), user["avatarId"])
+    user["avatarId"] = avatar_id          # keep the roster / fusion lookup current
     text      = _sanitise(data.get("text", ""), max_len=500)
     emotion   = _sanitise(data.get("emotion", "normal"), max_len=32)
     msg_type  = data.get("type", "say")
-    room      = _sanitise(data.get("room", user.get("room", "general")), max_len=32)
 
     if not text:
         return   # ignore empty messages
 
     # ── Rate limiting ─────────────────────────────────────────────────────────
-    # Bots are exempt so server-side automated messages are never throttled.
+    # Only sessions that authenticated as a bot with BOT_SECRET are exempt. The
+    # old check trusted the payload's avatarId / nick — and "chatbot" is also a
+    # normal avatar — so anyone could skip the limit just by claiming to be one.
     # The check runs before any history write or panel logic so blocked messages
     # cost essentially nothing server-side.
-    _is_bot_sender = (
-        _sanitise(data.get("avatarId", user.get("avatarId", "")), max_len=32).lower()
-        in BOT_AVATAR_IDS
-        or _sanitise(data.get("nick", user.get("nick", "")), max_len=32).lower()
-        in BOT_NICKS
-    )
-    if not _is_bot_sender:
+    if not user.get("bot"):
         _rl = _check_rate_limit(sid, _rate_msg, RATE_MSG_LIMIT, RATE_MSG_WARN, RATE_MSG_WINDOW)
         if _rl == "block":
             # Silently drop — send a private throttle notice to the sender only.
@@ -668,8 +803,10 @@ def on_chat_message(data: dict):
         "granizo":        bool(data.get("granizo",        False)),
         "streetDog":      bool(data.get("streetDog",      False)),
         "graveEntrance":  bool(data.get("graveEntrance",  False)),
-        "title":          str(data.get("title",  "")) or None,
-        "titleRarity":    str(data.get("titleRarity", "common")),
+        "title":          _sanitise(data.get("title", ""), max_len=64) or None,
+        "titleRarity":    (str(data.get("titleRarity", "common")).lower()
+                           if str(data.get("titleRarity", "common")).lower()
+                           in ("common", "uncommon", "rare", "legendary") else "common"),
     }
 
     _append_message(msg)
@@ -681,7 +818,8 @@ def on_chat_message(data: dict):
     # A sender is a bot if EITHER their avatarId OR their display nick matches
     # a known bot identity.  The nick check catches cases where a bot message
     # is sent with a non-canonical avatarId (e.g. during Event Mode).
-    is_bot       = (avatar_id.lower() in BOT_AVATAR_IDS) or (nick.lower() in BOT_NICKS)
+    is_bot       = bool(user.get("bot")) or (avatar_id.lower() in BOT_AVATAR_IDS) \
+                   or (nick.lower() in BOT_NICKS)
     # sfx panels are always Solo — they should never merge with dialogue panels
     is_solo_type = msg_type in ("action", "think", "sfx")
 
@@ -701,16 +839,23 @@ def on_chat_message(data: dict):
 
 
 @socketio.on("typing")
-def on_typing(data: dict):
+def on_typing(data=None):
     """
     Lightweight ephemeral event — not stored in history.
     Client sends: { nick, room, isTyping }
     Forwarded to everyone else in the room.
     """
-    sid  = _sid()
-    user = online_users.get(sid, {})
-    room = _sanitise(data.get("room", user.get("room", "general")), max_len=32)
-    emit("typing", data, to=room, include_self=False)
+    sid, user = _joined_user()
+    if user is None:
+        return
+    # Per-sid cap; excess is dropped silently (typing is purely cosmetic).
+    if _check_rate_limit(sid, _rate_typing, RATE_TYPING_LIMIT, RATE_TYPING_LIMIT,
+                         RATE_TYPING_WINDOW) == "block":
+        return
+    is_typing = bool(data.get("isTyping")) if isinstance(data, dict) else False
+    # Rebuilt from the session — the raw payload is never relayed.
+    emit("typing", {"nick": user["nick"], "room": user["room"], "isTyping": is_typing},
+         to=user["room"], include_self=False)
 
 
 @socketio.on("event_mode")
@@ -735,12 +880,15 @@ def on_event_mode(data: dict):
     Client sends:
         { nick, avatarId, room, active: bool }
     """
-    sid  = _sid()
-    user = online_users.get(sid, {})
-
-    nick      = _sanitise(data.get("nick",     user.get("nick", "?")),      max_len=32)
-    avatar_id = _sanitise(data.get("avatarId", user.get("avatarId", "kid")), max_len=32)
-    room      = _sanitise(data.get("room",     user.get("room", "general")), max_len=32)
+    sid, user = _joined_user()
+    if user is None or not isinstance(data, dict):
+        return
+    # Identity + room come from the session. This matters here more than most:
+    # the room's "initiator" slot is keyed by nick, so a spoofed nick could end
+    # someone else's Event Mode.
+    nick      = user["nick"]
+    avatar_id = _clean_id(data.get("avatarId"), user["avatarId"])
+    room      = user["room"]
     active    = bool(data.get("active", True))
 
     # ── Per-room initiator tracking ───────────────────────────────────────────
@@ -794,13 +942,16 @@ def on_update_tv_video(data: dict):
     Server broadcasts ``sync_tv`` to everyone in the room (including sender,
     so their own startTV is also called via the listener — consistent path).
     """
-    sid  = _sid()
-    user = online_users.get(sid, {})
-    room    = _sanitise(data.get("room",    user.get("room", "general")), max_len=32)
+    sid, user = _joined_user()
+    if user is None or not isinstance(data, dict):
+        return
+    room     = user["room"]
     video_id = _sanitise(data.get("videoId", ""), max_len=16)
     prop_id  = _sanitise(data.get("propId",  ""), max_len=64)
 
-    if not video_id or not prop_id:
+    # The id is spliced into an embed URL by the clients — only plain YouTube-id
+    # characters are allowed (no "?", "/", "&" … that could alter the URL).
+    if not _VIDEO_RE.match(video_id) or not _PROP_RE.match(prop_id):
         return
 
     socketio.emit("sync_tv", {"videoId": video_id, "propId": prop_id}, to=room)
@@ -817,10 +968,13 @@ def on_end_tv_video(data: dict):
 
     Server broadcasts ``sync_tv_stop`` to everyone in the room.
     """
-    sid  = _sid()
-    user = online_users.get(sid, {})
-    room   = _sanitise(data.get("room",   user.get("room", "general")), max_len=32)
+    sid, user = _joined_user()
+    if user is None or not isinstance(data, dict):
+        return
+    room    = user["room"]
     prop_id = _sanitise(data.get("propId", ""), max_len=64)
+    if not _PROP_RE.match(prop_id):
+        return
 
     socketio.emit("sync_tv_stop", {"propId": prop_id}, to=room)
     print(f"[tv] sync_tv_stop propId={prop_id} room=#{room}")
@@ -837,9 +991,10 @@ def on_sync_tv_size(data: dict):
     Server broadcasts ``sync_tv_size`` to everyone ELSE in the room.
     The sender already applied the size change locally.
     """
-    sid  = _sid()
-    user = online_users.get(sid, {})
-    room = _sanitise(data.get("room", user.get("room", "general")), max_len=32)
+    sid, user = _joined_user()
+    if user is None or not isinstance(data, dict):
+        return
+    room = user["room"]
     size = data.get("size", "mini")
     if size not in ("mini", "big"):
         size = "mini"
@@ -906,12 +1061,21 @@ def on_room_command(data: dict):
         'possession', 'game_over',
         # batch 12 — room-exclusive commands
         'rush_hour',
+        # batch 13 — any-room commands
+        'beam',
+        # batch 14 — La Pared
+        'graffiti',
+        # batch 15 — image / GIF prop
+        'image_post', 'image_clear',
     }
 
-    sid  = _sid()
-    user = online_users.get(sid, {})
-    room      = _sanitise(data.get("room", user.get("room", "general")), max_len=32)
-    cmd_type  = _sanitise(data.get("type", ""), max_len=32)
+    sid, user = _joined_user()
+    if user is None or not isinstance(data, dict):
+        return
+    # WHO (actor) and WHERE (room) are the session's — never the payload's.
+    actor    = user["nick"]
+    room     = user["room"]
+    cmd_type = _sanitise(data.get("type", ""), max_len=32)
 
     if cmd_type not in ALLOWED_TYPES:
         return
@@ -919,14 +1083,8 @@ def on_room_command(data: dict):
     # ── Rate limiting ─────────────────────────────────────────────────────────
     # Commands are cheaper than chat messages (no history write) but still
     # represent a spam vector (e.g. /apagon, /disco-ball spam).
-    # Bots are exempt by the same rule as on_chat_message.
-    _cmd_nick      = _sanitise(data.get("nick") or data.get("initiator") or user.get("nick", ""), max_len=32)
-    _cmd_avatar_id = _sanitise(data.get("avatarId", user.get("avatarId", "")), max_len=32)
-    _is_bot_cmd    = (
-        _cmd_avatar_id.lower() in BOT_AVATAR_IDS
-        or _cmd_nick.lower()   in BOT_NICKS
-    )
-    if not _is_bot_cmd:
+    # Only authenticated bot sessions are exempt (same rule as on_chat_message).
+    if not user.get("bot"):
         _rl_cmd = _check_rate_limit(sid, _rate_cmd, RATE_CMD_LIMIT, RATE_CMD_WARN, RATE_CMD_WINDOW)
         if _rl_cmd == "block":
             emit(
@@ -936,7 +1094,7 @@ def on_room_command(data: dict):
                     f"Max {RATE_CMD_LIMIT} commands per {int(RATE_CMD_WINDOW)}s."
                 )},
             )
-            print(f"[rate-limit/block] room_command '{cmd_type}' from sid={sid} nick={_cmd_nick!r} dropped")
+            print(f"[rate-limit/block] room_command '{cmd_type}' from sid={sid} nick={actor!r} dropped")
             return
         if _rl_cmd == "warn":
             emit(
@@ -947,11 +1105,17 @@ def on_room_command(data: dict):
                 )},
             )
 
-    # Build a clean, server-stamped payload to prevent client spoofing
+    # Build a clean, server-stamped payload. Every field that names the ACTOR is
+    # overwritten with the session's nick, so the per-type branches below (which
+    # read data["nick"] / data["from"] / data["initiator"]) cannot be spoofed:
+    # nobody can fire /bsod, /petrify, /set_title … "as" another user.
+    # Fields that name a TARGET (data["target"]) are the client's choice.
+    data = dict(data)
+    data["nick"] = data["from"] = data["initiator"] = actor
     payload = {
         "type":     cmd_type,
         "room":     room,
-        "fromNick": _sanitise(data.get("nick") or data.get("from") or user.get("nick", "?"), max_len=32),
+        "fromNick": actor,
     }
 
     # ── Type-specific field passthrough (sanitised individually) ─────────────
@@ -970,7 +1134,7 @@ def on_room_command(data: dict):
         payload["target"] = _sanitise(data.get("target", ""), max_len=32)
     elif cmd_type == "focus":
         payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
-        payload["count"]  = min(int(data.get("count", 3)), 10)
+        payload["count"]  = _to_int(data.get("count", 3), 3, 0, 10)
     elif cmd_type == "dim":
         payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
         payload["active"] = bool(data.get("active", True))
@@ -989,12 +1153,14 @@ def on_room_command(data: dict):
     elif cmd_type == "quiniela":
         payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
         raw_num           = str(data.get("number", "00"))
-        payload["number"] = raw_num if (raw_num.isdigit() and 10 <= int(raw_num) <= 99) else "42"
+        # isascii(): str.isdigit() is also True for e.g. "²", which int() rejects
+        payload["number"] = raw_num if (raw_num.isascii() and raw_num.isdigit()
+                                        and 10 <= int(raw_num) <= 99) else "42"
 
     # /win_tab — nick + duration in ms (capped at 10 s)
     elif cmd_type == "win_tab":
         payload["nick"]       = _sanitise(data.get("nick", ""), max_len=32)
-        payload["durationMs"] = min(int(data.get("durationMs", 3000)), 10_000)
+        payload["durationMs"] = _to_int(data.get("durationMs", 3000), 3000, 0, 10_000)
 
     # One-shot transition commands — nick only, no active flag
     elif cmd_type in ("page_flip", "subte", "alt_f4"):
@@ -1036,8 +1202,8 @@ def on_room_command(data: dict):
             return
         payload['initiator']         = initiator
         payload['target']            = target
-        payload['initiatorAvatarId'] = _sanitise(
-            data.get('initiatorAvatarId', 'kid'), max_len=32)
+        payload['initiatorAvatarId'] = _clean_id(
+            data.get('initiatorAvatarId'), user.get('avatarId', 'kid'))
         # Resolve target's live avatarId from online_users so all clients
         # see the correct sprite even if the target never sent their avatarId
         target_avatar = 'kid'
@@ -1046,7 +1212,7 @@ def on_room_command(data: dict):
                 target_avatar = u.get('avatarId', 'kid')
                 break
         payload['targetAvatarId'] = target_avatar
-        payload['durationMs']     = min(int(data.get('durationMs', 30000)), 60000)
+        payload['durationMs']     = _to_int(data.get('durationMs', 30000), 30000, 0, 60000)
 
     # /shun — cinematic special move; carries initiator + target nicks
     elif cmd_type == "shun":
@@ -1077,7 +1243,12 @@ def on_room_command(data: dict):
     # /overlay_caption — nick + short text
     elif cmd_type == "overlay_caption":
         payload["nick"]    = _sanitise(data.get("nick", ""), max_len=32)
-        payload["caption"] = _sanitise(str(data.get("caption", "MEANWHILE…")), max_len=48)
+        # Canonical field is "caption". Older clients sent "text" (and the caption was
+        # silently dropped), so accept both; fall back to the default only if empty.
+        raw_caption = data.get("caption")
+        if raw_caption is None or str(raw_caption).strip() == "":
+            raw_caption = data.get("text")
+        payload["caption"] = _sanitise(str(raw_caption or ""), max_len=48) or "MEANWHILE…"
 
     # /set_aura — nick + aura string ('gold' | 'blue' | 'dark' | '' = clear)
     elif cmd_type == "set_aura":
@@ -1180,11 +1351,7 @@ def on_room_command(data: dict):
     # one-shot, nick + a sanitised fake score.
     elif cmd_type == "highscore":
         payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
-        try:
-            score = int(data.get("score", 0))
-        except (TypeError, ValueError):
-            score = 0
-        payload["score"] = max(0, min(score, 9_999_999))
+        payload["score"] = _to_int(data.get("score", 0), 0, 0, 9_999_999)
 
     # /fishing — TranquilBoat-exclusive (enforced client-side in chat.js);
     # one-shot, nick only.
@@ -1255,8 +1422,58 @@ def on_room_command(data: dict):
     elif cmd_type == "rush_hour":
         payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
 
+    # /beam — any room; one-shot transporter materialize effect on the
+    # sender's avatar (reuses playTeleportIn() client-side); nick only.
+    elif cmd_type == "beam":
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+
+    # /graffiti — La Pared; nick + capped text + colour from a fixed allow-list.
+    # Empty text is dropped (nothing to spray).
+    elif cmd_type == "graffiti":
+        VALID_GRAFFITI_COLORS = {"white", "yellow", "red", "cyan", "pink", "lime", "orange"}
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+        payload["text"] = _sanitise(data.get("text", ""), max_len=48)
+        if not payload["text"]:
+            return
+        raw_color = str(data.get("color", "white")).strip().lower()
+        payload["color"] = raw_color if raw_color in VALID_GRAFFITI_COLORS else "white"
+
+    # /image_post — a direct image / GIF link shown to the whole room.
+    # Order matters: validation first (an invalid URL must not burn the user's slot),
+    # then the room replace lock (also side-effect free), then the per-user limiter.
+    elif cmd_type == "image_post":
+        safe_url = _validate_image_url(data.get("url"))
+        if safe_url is None:
+            return                                   # invalid → dropped silently
+        now = time.time()
+        with _image_lock:
+            current = _room_images.get(room)
+            if current and current["by"] != actor and (now - current["ts"]) < IMG_MIN_DISPLAY_SECS:
+                wait = int(IMG_MIN_DISPLAY_SECS - (now - current["ts"])) + 1
+                emit("system_msg", {"text": (
+                    f"🖼️ An image is already showing — it can be replaced in {wait}s."
+                )})
+                return
+        if not user.get("bot"):
+            if _check_rate_limit(sid, _rate_img, IMG_POST_LIMIT, IMG_POST_LIMIT,
+                                 IMG_POST_WINDOW) == "block":
+                emit("system_msg", {"text": (
+                    f"🖼️ Slow down — one image every {int(IMG_POST_WINDOW)}s."
+                )})
+                return
+        with _image_lock:
+            _room_images[room] = {"by": actor, "ts": now}
+        payload["nick"] = actor                      # attribution is the SESSION's nick
+        payload["url"]  = safe_url                   # the rebuilt, validated URL
+
+    # /image_clear — anyone may clear; the replace lock never blocks this.
+    elif cmd_type == "image_clear":
+        with _image_lock:
+            _room_images.pop(room, None)
+        payload["nick"] = actor
+
     socketio.emit("room_command", payload, to=room)
-    print(f"[room_command] {cmd_type} by {payload['fromNick']} in #{room}")
+    print(f"[room_command] {cmd_type} by {payload['fromNick']} in #{room}")   # (no URLs in the log)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1269,9 +1486,84 @@ def _sid() -> str:
     return request.sid           # type: ignore[attr-defined]
 
 
-def _sanitise(value: str, max_len: int = 256) -> str:
-    """Strip leading/trailing whitespace and truncate."""
-    return str(value).strip()[:max_len]
+# ── Input hygiene ────────────────────────────────────────────────────────────
+_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_ID_RE      = re.compile(r"^[A-Za-z0-9_-]{1,32}$")      # avatar ids: knight, dwarf_jump…
+_VIDEO_RE   = re.compile(r"^[A-Za-z0-9_-]{1,16}$")      # YouTube ids (end up in an embed URL)
+_PROP_RE    = re.compile(r"^[A-Za-z0-9_-]{1,64}$")      # prop ids: prop-cc-2…
+
+
+def _sanitise(value, max_len: int = 256) -> str:
+    """Replace control characters, strip surrounding whitespace, truncate."""
+    return _CTRL_CHARS.sub(" ", str(value)).strip()[:max_len]
+
+
+def _clean_nick(raw) -> str:
+    """A display nick: no control chars, single spaces, ≤32 chars, never empty."""
+    nick = " ".join(_sanitise("" if raw is None else raw, 64).split())[:32].strip()
+    return nick or "Anonymous"
+
+
+def _clean_room(raw) -> str:
+    return _sanitise("" if raw is None else raw, 32) or "general"
+
+
+def _clean_id(raw, fallback: str) -> str:
+    """Accept only identifier-shaped values (avatar ids…); otherwise *fallback*."""
+    value = "" if raw is None else str(raw).strip()
+    return value if _ID_RE.match(value) else fallback
+
+
+def _to_int(raw, default: int, lo: int, hi: int) -> int:
+    """int(raw) clamped to [lo, hi]; garbage input gives *default* instead of an exception."""
+    try:
+        n = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        n = default
+    return max(lo, min(hi, n))
+
+
+# ── Session identity ─────────────────────────────────────────────────────────
+# The ONLY source of truth for "who is this" and "which room" is the session
+# registered by on_join. Whatever nick / room / initiator a client puts in an
+# event payload is ignored.
+
+def _joined_user():
+    """(sid, user) for the current connection; user is None until it has joined a room."""
+    sid  = _sid()
+    user = online_users.get(sid)
+    if not user or not user.get("room"):
+        return sid, None
+    return sid, user
+
+
+def _is_trusted_bot(secret) -> bool:
+    return bool(BOT_SECRET) and isinstance(secret, str) \
+        and hmac.compare_digest(secret.encode(), BOT_SECRET.encode())
+
+
+def _unique_nick(room: str, desired: str, sid: str, trusted_bot: bool) -> str:
+    """*desired*, or desired_2, desired_3… if another user in *room* already
+    has it (case-insensitive) or it is a reserved bot nick. Caller holds _users_lock."""
+    taken    = {u["nick"].lower() for other, u in online_users.items()
+                if other != sid and u.get("room") == room}
+    reserved = set() if trusted_bot else set(BOT_NICKS)
+    candidate, n = desired, 1
+    while candidate.lower() in taken or candidate.lower() in reserved:
+        n += 1
+        suffix    = f"_{n}"
+        candidate = desired[:32 - len(suffix)] + suffix
+    return candidate
+
+
+def _release_event(room: str, nick: str) -> None:
+    """If *nick* started the room's Event Mode, clear it and tell the room —
+    otherwise the red banner would stay up forever after the initiator leaves."""
+    with _event_lock:
+        if _active_events.get(room) != nick:
+            return
+        _active_events.pop(room, None)
+    socketio.emit("global_event_mode", {"nick": nick, "room": room, "active": False}, to=room)
 
 
 def _broadcast_user_list(room: str) -> None:
@@ -1292,4 +1584,8 @@ if __name__ == "__main__":
     print(f"Argensoft Comic Chat server starting on http://{HOST}:{PORT}")
     print(f"Async mode : {ASYNC_MODE}")
     print(f"History    : {HISTORY_FILE.resolve()} (max {MAX_HISTORY} messages)")
-    socketio.run(app, host=HOST, port=PORT, debug=False, use_reloader=False)
+    if SECRET_KEY == "change-me-in-production":
+        print("WARNING    : SECRET_KEY is the default — set the SECRET_KEY environment variable.")
+    print(f"Bot access : {'enabled (BOT_SECRET set)' if BOT_SECRET else 'off (BOT_SECRET not set)'}")
+    run_kwargs = {"allow_unsafe_werkzeug": True} if ASYNC_MODE == "threading" else {}
+    socketio.run(app, host=HOST, port=PORT, debug=False, use_reloader=False, **run_kwargs)
