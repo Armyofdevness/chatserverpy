@@ -120,6 +120,14 @@ IMG_POST_LIMIT       = 1      # posts per user …
 IMG_POST_WINDOW      = 30.0   # … per this many seconds
 IMG_MIN_DISPLAY_SECS = 20     # nobody else may replace an image for this long
 
+# Frame props (actionType "frame") — pictures hung IN the room art. Several per room,
+# each independent. {room name: its frame prop ids}; keep in sync with data.js.
+# They share the validator, the replace lock length and the per-user post limiter
+# (_rate_img) with the overlay prop above, so nobody gets extra posts from having frames.
+IMAGE_FRAME_PROPS = {
+    "RainyCafe": frozenset({"prop-rc-3", "prop-rc-4"}),
+}
+
 # Per-sid deques: { sid: deque([timestamp, ...]) }
 # Written / read only inside the rate-limit helper (protected by GIL for CPython;
 # a dedicated lock is added for safety under eventlet green-threads).
@@ -269,6 +277,9 @@ _active_events: dict[str, str] = {}
 # IMG_MIN_DISPLAY_SECS of it being posted. Clearing is never blocked.
 # ─────────────────────────────────────────────────────────────────────────────
 _room_images: dict[str, dict] = {}
+# Frame props — {room: {prop_id: {"by": nick, "ts": epoch seconds}}}: the same replace
+# lock, but per frame (two frames in a room never block each other).
+_room_frames: dict[str, dict[str, dict]] = {}
 _image_lock = threading.Lock()
 
 
@@ -1067,6 +1078,8 @@ def on_room_command(data: dict):
         'graffiti',
         # batch 15 — image / GIF prop
         'image_post', 'image_clear',
+        # batch 16 — picture frames (independent, per prop)
+        'frame_post', 'frame_clear',
     }
 
     sid, user = _joined_user()
@@ -1471,6 +1484,41 @@ def on_room_command(data: dict):
         with _image_lock:
             _room_images.pop(room, None)
         payload["nick"] = actor
+
+    # /frame_post, /frame_clear — one picture frame (propId) in a room that has frames.
+    # propId must be one of THIS room's frame ids (session room, never the payload's).
+    elif cmd_type in ("frame_post", "frame_clear"):
+        prop_id = _sanitise(data.get("propId", ""), max_len=64)
+        if prop_id not in IMAGE_FRAME_PROPS.get(room, frozenset()):
+            return
+        if cmd_type == "frame_post":
+            safe_url = _validate_image_url(data.get("url"))
+            if safe_url is None:
+                return                               # invalid → dropped silently
+            now = time.time()
+            with _image_lock:
+                current = _room_frames.get(room, {}).get(prop_id)
+                if current and current["by"] != actor and (now - current["ts"]) < IMG_MIN_DISPLAY_SECS:
+                    wait = int(IMG_MIN_DISPLAY_SECS - (now - current["ts"])) + 1
+                    emit("system_msg", {"text": (
+                        f"🖼️ That frame was just filled — it can be replaced in {wait}s."
+                    )})
+                    return
+            if not user.get("bot"):
+                if _check_rate_limit(sid, _rate_img, IMG_POST_LIMIT, IMG_POST_LIMIT,
+                                     IMG_POST_WINDOW) == "block":
+                    emit("system_msg", {"text": (
+                        f"🖼️ Slow down — one image every {int(IMG_POST_WINDOW)}s."
+                    )})
+                    return
+            with _image_lock:
+                _room_frames.setdefault(room, {})[prop_id] = {"by": actor, "ts": now}
+            payload["url"] = safe_url                # the rebuilt, validated URL
+        else:
+            with _image_lock:
+                _room_frames.get(room, {}).pop(prop_id, None)
+        payload["nick"]   = actor
+        payload["propId"] = prop_id
 
     socketio.emit("room_command", payload, to=room)
     print(f"[room_command] {cmd_type} by {payload['fromNick']} in #{room}")   # (no URLs in the log)
