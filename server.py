@@ -126,6 +126,21 @@ IMG_MIN_DISPLAY_SECS = 20     # nobody else may replace an image for this long
 # (_rate_img) with the overlay prop above, so nobody gets extra posts from having frames.
 IMAGE_FRAME_PROPS = {
     "RainyCafe": frozenset({"prop-rc-3", "prop-rc-4"}),
+    # Cyberpunk: six perspective billboards (quad frames) — ids mirror data.js
+    "Cyberpunk": frozenset({"prop-cp-1", "prop-cp-2", "prop-cp-3",
+                            "prop-cp-4", "prop-cp-5", "prop-cp-6"}),
+}
+
+# Room-exclusive commands the SERVER enforces: the session's room (never the client's
+# claim) must match, otherwise the command is dropped. {command type: room name}.
+# (chat.js shows the friendly "only works in #X" error; this is the real gate.)
+ROOM_EXCLUSIVE_COMMANDS = {
+    "neon_flicker": "Cyberpunk",
+    "hack":         "Cyberpunk",
+    "glug":         "El Fondo del Mar",
+    "poster":       "La Pared",
+    "sirena":       "La Pared",
+    "pop3":         "TechTalk96",
 }
 
 # Per-sid deques: { sid: deque([timestamp, ...]) }
@@ -1080,6 +1095,10 @@ def on_room_command(data: dict):
         'image_post', 'image_clear',
         # batch 16 — picture frames (independent, per prop)
         'frame_post', 'frame_clear',
+        # batch 17 — Cyberpunk / El Fondo del Mar / La Pared / TechTalk96 exclusives,
+        #            Win95 gags and the sparkle emote (any room)
+        'neon_flicker', 'hack', 'glug', 'poster', 'sirena', 'pop3',
+        'clippy', 'hourglass', 'sparkle',
     }
 
     sid, user = _joined_user()
@@ -1091,6 +1110,11 @@ def on_room_command(data: dict):
     cmd_type = _sanitise(data.get("type", ""), max_len=32)
 
     if cmd_type not in ALLOWED_TYPES:
+        return
+
+    # Room-exclusive commands: the SESSION's room decides.
+    _only_room = ROOM_EXCLUSIVE_COMMANDS.get(cmd_type)
+    if _only_room is not None and room != _only_room:
         return
 
     # ── Rate limiting ─────────────────────────────────────────────────────────
@@ -1519,6 +1543,27 @@ def on_room_command(data: dict):
                 _room_frames.get(room, {}).pop(prop_id, None)
         payload["nick"]   = actor
         payload["propId"] = prop_id
+
+    # ── batch 17 ──────────────────────────────────────────────────────────────
+    # One-shots, nick only. Visuals are all client-side (websocket-patch.js).
+    #   /neon_flicker, /hack — Cyberpunk · /sirena — La Pared · /pop3 — TechTalk96
+    #   /clippy, /hourglass, /sparkle — any room
+    elif cmd_type in ("neon_flicker", "hack", "sirena", "pop3",
+                      "clippy", "hourglass", "sparkle"):
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+
+    # /glug — El Fondo del Mar; toggle (nick + active). The garbling itself happens in
+    # the sender's client when it sends a message.
+    elif cmd_type == "glug":
+        payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
+        payload["active"] = bool(data.get("active", True))
+
+    # /poster — La Pared; nick + capped text. Empty text is dropped.
+    elif cmd_type == "poster":
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+        payload["text"] = _sanitise(data.get("text", ""), max_len=60)
+        if not payload["text"]:
+            return
 
     socketio.emit("room_command", payload, to=room)
     print(f"[room_command] {cmd_type} by {payload['fromNick']} in #{room}")   # (no URLs in the log)
