@@ -150,6 +150,41 @@ _rate_msg: dict[str, collections.deque] = {}
 _rate_cmd: dict[str, collections.deque] = {}
 _rate_typing: dict[str, collections.deque] = {}
 _rate_img: dict[str, collections.deque] = {}
+_rate_counts: dict[str, collections.deque] = {}   # get_room_counts / get_rooms requests
+_rate_room_admin: dict[str, collections.deque] = {}   # create_room / update_room
+
+# ── User-created ("custom") rooms ────────────────────────────────────────────
+# Registry shared by every client: created via "create_room", listed to all
+# clients through the "room_list" event, editable only by the creating session.
+# In memory only — custom rooms are gone after a server restart (by design).
+MAX_CUSTOM_ROOMS        = 20          # total custom rooms alive at once
+CUSTOM_ROOM_EMPTY_TTL   = 30 * 60     # seconds a custom room may stay EMPTY before deletion
+CUSTOM_ROOM_SWEEP_EVERY = 60          # sweeper poll interval, seconds
+CUSTOM_ROOM_NAME_MIN    = 3
+CUSTOM_ROOM_NAME_MAX    = 32
+CUSTOM_ROOM_TOPIC_MAX   = 64
+CUSTOM_ROOM_AVATARS_MAX = 200
+
+# Built-in rooms (names must mirror ROOMS_DATA in data.js, plus the "general"
+# fallback used when a client sends no room). A custom room may not collide with
+# one of these — compared without case, spaces or punctuation, so "thedungeon"
+# and "Godzillas Attack" are taken too. KEEP IN SYNC when adding a built-in room.
+BUILTIN_ROOM_NAMES = (
+    "ComicCafe", "TechTalk96", "GamersZone", "Argentinos", "RainyCafe",
+    "TranquilBoat", "Cemetery", "Starship", "Godzilla's Attack", "Biblioteca",
+    "Subte", "Estadio", "Arcades", "THE DUNGEON", "La Pared",
+    "El Fondo del Mar", "Cyberpunk", "general",
+)
+
+def _room_key(name: str) -> str:
+    """Normalised identity of a room name: casefolded, letters/digits only."""
+    return re.sub(r"[\W_]+", "", str(name).casefold())
+
+BUILTIN_ROOM_KEYS = frozenset(_room_key(n) for n in BUILTIN_ROOM_NAMES)
+
+_custom_rooms: dict[str, dict] = {}     # _room_key(name) -> room record
+_custom_rooms_lock = threading.Lock()
+_room_sweeper_running = False
 _rate_lock = threading.Lock()
 
 # ── App & Socket init ─────────────────────────────────────────────────────────
@@ -354,6 +389,144 @@ _active_pasacalle: dict[str, str] = {}
 _pasacalle_lock = threading.Lock()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Room weather — {room: {"precip": None|"rain"|"storm", "wind": bool, "until": ts|None}}
+#
+# Same idea as the pasacalle banner above: a per-room decoration that late joiners must
+# see (sent to them in on_join as "weather_state"). The clients draw it; the server only
+# keeps the state and decides what each command does:
+#
+#   /rain     rain that stops by itself after WEATHER_TIMED_SECS ("timed")
+#   /rainall  rain until the same command is used again          ("constant")
+#   /storm    storm (heavy rain + lightning + overcast) until toggled
+#   /snow     snowfall (client alias /nieve) until toggled — joins rain/rainall/storm as the one precipitation
+#   /hail     hail (client alias /granizo) until toggled — same precipitation slot
+#   /wind     independent flag — avatars sway; rain slants harder
+#   /sun /fog /frost   the room's "sky": ONE of sun / fog / frost at a time (the same command
+#             again = off, another one replaces it). Independent of precipitation and wind, so
+#             /snow + /frost or /rain + /fog can run together. Never expires on its own.
+#
+# Rain / rainall / storm are mutually exclusive (one precipitation at a time): the same
+# command again turns it OFF, any other one REPLACES it. Timed rain expires lazily — the
+# state is checked when someone joins or issues a weather command, and each client also
+# stops its own copy when `remainingMs` runs out — so no background timer is needed.
+# The state is dropped when the room empties, so weather never lingers in an empty room.
+# ─────────────────────────────────────────────────────────────────────────────
+WEATHER_TIMED_SECS    = 120      # how long a /rain lasts
+WEATHER_COOLDOWN_SECS = 2.0      # min gap between weather changes in one room (toggle wars)
+WEATHER_PRECIP_CMDS   = {        # command → (precipitation, timed?)
+    "rain":    ("rain",  True),
+    "rainall": ("rain",  False),
+    "storm":   ("storm", False),
+    "snow":    ("snow",  False),
+    "hail":    ("hail",  False),
+}
+WEATHER_SKY_CMDS = ("sun", "fog", "frost")   # command == the sky value it sets
+# Independent ambience toggles (a SET, they stack with any precipitation / wind / sky):
+#   /wisps /fireflies /meteors /eclipse.  An eclipse and the sun exclude each other.
+WEATHER_FX_CMDS = ("wisps", "fireflies", "meteors", "eclipse")
+# Rooms whose ambience starts on by itself: the first person to join an EMPTY room finds this
+# weather already running (it is not announced — see "ambient" below). It is ordinary weather
+# afterwards: any user can toggle it off, and it stays off until the room has been empty and
+# somebody joins it again. Edit this table to give another room a default.
+WEATHER_ROOM_DEFAULTS = {
+    "Cemetery": {"sky": "fog"},
+}
+_weather_seeded: set[str] = set()      # rooms already seeded during their current occupancy
+_active_weather: dict[str, dict] = {}
+_weather_last:   dict[str, float] = {}
+_weather_lock = threading.Lock()
+
+
+def _weather_seed_locked(room: str) -> None:
+    """Start the room's default ambience, once per occupancy. Caller holds _weather_lock."""
+    base = WEATHER_ROOM_DEFAULTS.get(room)
+    if not base or room in _weather_seeded:
+        return
+    _weather_seeded.add(room)
+    if room not in _active_weather:
+        _active_weather[room] = {"precip": None, "wind": False, "sky": None, "until": None,
+                                 "ambient": True, **base}
+
+
+def _weather_snapshot_locked(room: str) -> dict:
+    """What the clients need for *room* right now. Caller holds _weather_lock.
+    Drops timed rain that has run out (lazy expiry)."""
+    st  = _active_weather.get(room)
+    now = time.time()
+    if st and st["until"] and now >= st["until"]:
+        st["precip"], st["until"] = None, None
+        if not st["wind"] and not st.get("sky") and not st.get("fx"):
+            _active_weather.pop(room, None)
+            st = None
+    if not st:
+        return {"precip": None, "wind": False, "sky": None, "fx": [], "ambient": False, "timed": False, "remainingMs": 0}
+    return {
+        "precip":      st["precip"],
+        "wind":        st["wind"],
+        "sky":         st.get("sky"),
+        "fx":          sorted(st.get("fx") or ()),
+        "ambient":     bool(st.get("ambient")),     # still just the room's default → not announced
+        "timed":       bool(st["until"]),
+        "remainingMs": int(max(0.0, st["until"] - now) * 1000) if st["until"] else 0,
+    }
+
+
+def _weather_apply(room: str, cmd: str):
+    """Apply a weather command to *room*. Returns the new snapshot, or None if the room's
+    weather was changed less than WEATHER_COOLDOWN_SECS ago."""
+    now = time.time()
+    with _weather_lock:
+        if now - _weather_last.get(room, 0.0) < WEATHER_COOLDOWN_SECS:
+            return None
+        _weather_seed_locked(room)
+        _weather_snapshot_locked(room)                      # lazy-expire first
+        st = _active_weather.setdefault(
+            room, {"precip": None, "wind": False, "sky": None, "fx": set(), "until": None})
+        st.setdefault("fx", set())
+        st["ambient"] = False                               # someone took charge of the weather
+        if cmd == "clearweather":                           # switch EVERYTHING weather-related off
+            st["precip"], st["until"], st["wind"], st["sky"] = None, None, False, None
+            st["fx"].clear()
+        elif cmd == "wind":
+            st["wind"] = not st["wind"]
+        elif cmd in WEATHER_FX_CMDS:
+            if cmd in st["fx"]:
+                st["fx"].discard(cmd)
+            else:
+                st["fx"].add(cmd)
+                if cmd == "eclipse" and st.get("sky") == "sun":
+                    st["sky"] = None                               # the moon covers the sun
+        elif cmd in WEATHER_SKY_CMDS:
+            st["sky"] = None if st.get("sky") == cmd else cmd      # same again → off, other → replace
+            if st["sky"] == "sun":
+                st["fx"].discard("eclipse")
+        else:
+            want, timed = WEATHER_PRECIP_CMDS[cmd]
+            if st["precip"] == want and bool(st["until"]) == timed:
+                st["precip"], st["until"] = None, None      # same command again → off
+            else:
+                st["precip"] = want
+                st["until"]  = (now + WEATHER_TIMED_SECS) if timed else None
+        _weather_last[room] = now
+        if not st["precip"] and not st["wind"] and not st.get("sky") and not st["fx"]:
+            _active_weather.pop(room, None)
+        return _weather_snapshot_locked(room)
+
+
+def _weather_clear_if_empty(room) -> None:
+    """Forget a room's weather once nobody is in it any more."""
+    if not room:
+        return
+    with _users_lock:
+        occupied = any(u.get("room") == room for u in online_users.values())
+    if not occupied:
+        with _weather_lock:
+            _active_weather.pop(room, None)
+            _weather_last.pop(room, None)
+            _weather_seeded.discard(room)
+
+
 def _try_panel_upgrade(msg: dict) -> bool:
     """
     Attempt to upgrade the most recent in-progress human panel in this room
@@ -482,7 +655,6 @@ def _to_speaker(msg: dict) -> dict:
         "void":           bool(msg.get("void",           False)),
         "mirror":         bool(msg.get("mirror",         False)),
         "weight":         bool(msg.get("weight",         False)),
-        "heavyRain":      bool(msg.get("heavyRain",      False)),
         "inkBleed":       bool(msg.get("inkBleed",       False)),
         "pageTear":       bool(msg.get("pageTear",       False)),
         "ghostWriter":    bool(msg.get("ghostWriter",    False)),
@@ -497,7 +669,6 @@ def _to_speaker(msg: dict) -> dict:
         "avatarMissing":  bool(msg.get("avatarMissing",  False)),
         "roughCut":       bool(msg.get("roughCut",       False)),
         "negativeSpace":  bool(msg.get("negativeSpace",  False)),
-        "granizo":        bool(msg.get("granizo",        False)),
         "streetDog":      bool(msg.get("streetDog",      False)),
         "graveEntrance":  bool(msg.get("graveEntrance",  False)),
         "title":          str(msg.get("title",  "")) or None,
@@ -557,8 +728,10 @@ def get_history():
 
 @socketio.on("connect")
 def on_connect():
-    """Client connected — nothing to broadcast yet; wait for 'join'."""
+    """Client connected — hand it the shared custom-room list right away so the
+    Room List is complete even before the user opens it."""
     print(f"[connect] sid={_sid()}")
+    emit("room_list", {"rooms": _public_rooms()})
 
 
 @socketio.on("disconnect")
@@ -575,8 +748,11 @@ def on_disconnect():
         _rate_cmd.pop(sid, None)
         _rate_typing.pop(sid, None)
         _rate_img.pop(sid, None)
+        _rate_counts.pop(sid, None)
+        _rate_room_admin.pop(sid, None)
 
     room = user.get("room") if user else None
+    _weather_clear_if_empty(room)          # (the user is already out of online_users)
     if user and room:                      # room is None after an explicit "leave"
         leave_room(room)
         _release_event(room, user["nick"])
@@ -587,6 +763,8 @@ def on_disconnect():
             to=room,
         )
         print(f"[disconnect] {user['nick']} left #{room}")
+    if user:
+        _broadcast_room_counts()           # the room list must drop them too
 
 
 @socketio.on("join")
@@ -626,6 +804,7 @@ def on_join(data: dict):
     if prev_room and prev_room != room:
         leave_room(prev_room)
         _release_event(prev_room, prev_nick)
+        _weather_clear_if_empty(prev_room)
         socketio.emit(
             "system_msg",
             {"text": f"*** {prev_nick} has left #{prev_room}"},
@@ -651,8 +830,16 @@ def on_join(data: dict):
         banner_text = _active_pasacalle.get(room, "")
     emit("room_banner", {"text": banner_text})
 
+    # Same for the room's weather: a joiner (or a client that just switched rooms) gets the
+    # current state — or a clean slate — straight away.
+    with _weather_lock:
+        _weather_seed_locked(room)
+        weather_now = _weather_snapshot_locked(room)
+    emit("weather_state", weather_now)
+
     # Broadcast updated user list to everyone in the new room
     _broadcast_user_list(room)
+    _broadcast_room_counts()               # …and fresh per-room counts to EVERYONE
 
     # Announce arrival
     emit(
@@ -685,6 +872,7 @@ def on_leave(data=None):
     # no room: the old room's roster no longer lists them, messages sent in the
     # gap are dropped, and on_join will not announce the departure a second time.
     user["room"] = None
+    _weather_clear_if_empty(room)
 
     emit(
         "system_msg",
@@ -692,7 +880,95 @@ def on_leave(data=None):
         to=room,
     )
     _broadcast_user_list(room)
+    _broadcast_room_counts()
     print(f"[leave] {nick} left #{room}")
+
+
+@socketio.on("get_room_counts")
+def on_get_room_counts(data=None):
+    """Room-list dialog asks for the current head-count of every room.
+    Answered to the requester only; rate-limited because the dialog can be
+    opened repeatedly."""
+    sid = _sid()
+    if _check_rate_limit(sid, _rate_counts, 10, 10, 5.0) == "block":
+        return
+    emit("room_counts", _room_counts())
+
+
+@socketio.on("get_rooms")
+def on_get_rooms(data=None):
+    """Re-send the shared custom-room list to the requester (Room List opened)."""
+    sid = _sid()
+    if _check_rate_limit(sid, _rate_counts, 10, 10, 5.0) == "block":
+        return
+    emit("room_list", {"rooms": _public_rooms()})
+
+
+@socketio.on("create_room")
+def on_create_room(data=None):
+    """Create a shared custom room. Answered through the Socket.IO ack:
+    {"ok": True, "room": {...}} or {"ok": False, "error": "..."}.
+    The creator is the calling SESSION (not the nick, which is not unique)."""
+    sid, user = _joined_user()
+    if not user:
+        return {"ok": False, "error": "Join a room first."}
+    if _check_rate_limit(sid, _rate_room_admin, 10, 10, 30.0) == "block":
+        return {"ok": False, "error": "Too many room changes — wait a moment."}
+
+    fields, err = _validate_room_fields(data, require_name=True)
+    if err:
+        return {"ok": False, "error": err}
+
+    key = _room_key(fields["name"])
+    with _custom_rooms_lock:
+        if key in BUILTIN_ROOM_KEYS:
+            return {"ok": False, "error": f"#{fields['name']} is a reserved room name."}
+        if key in _custom_rooms:
+            return {"ok": False, "error": f"Room #{fields['name']} already exists!"}
+        if len(_custom_rooms) >= MAX_CUSTOM_ROOMS:
+            return {"ok": False, "error": f"The server already has {MAX_CUSTOM_ROOMS} custom rooms. "
+                                          f"Try again once an empty one expires."}
+        _custom_rooms[key] = {
+            **fields,
+            "creator":    user["nick"],
+            "creatorSid": sid,
+            "createdAt":  time.time(),
+            "emptySince": None,
+        }
+    _ensure_room_sweeper()
+    _broadcast_room_list()
+    print(f"[rooms] {user['nick']} created #{fields['name']}")
+    return {"ok": True, "room": next(r for r in _public_rooms() if r["name"] == fields["name"])}
+
+
+@socketio.on("update_room")
+def on_update_room(data=None):
+    """Edit a custom room — ONLY the session that created it. The name cannot
+    change (people are inside the socket room of that name)."""
+    sid, user = _joined_user()
+    if not user:
+        return {"ok": False, "error": "Join a room first."}
+    if _check_rate_limit(sid, _rate_room_admin, 10, 10, 30.0) == "block":
+        return {"ok": False, "error": "Too many room changes — wait a moment."}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "Invalid request."}
+
+    fields, err = _validate_room_fields(data, require_name=False)
+    if err:
+        return {"ok": False, "error": err}
+
+    key = _room_key(data.get("name", ""))
+    with _custom_rooms_lock:
+        room = _custom_rooms.get(key)
+        if room is None:
+            return {"ok": False, "error": "That room no longer exists."}
+        if room["creatorSid"] != sid:
+            return {"ok": False, "error": "Only the room creator can edit its properties."}
+        room.update(fields)
+        name = room["name"]
+    _broadcast_room_list()
+    socketio.emit("system_msg", {"text": f"*** {user['nick']} updated the properties of #{name}"}, to=name)
+    return {"ok": True}
 
 
 @socketio.on("chat_message")
@@ -811,7 +1087,6 @@ def on_chat_message(data: dict):
         "void":           bool(data.get("void",           False)),
         "mirror":         bool(data.get("mirror",         False)),
         "weight":         bool(data.get("weight",         False)),
-        "heavyRain":      bool(data.get("heavyRain",      False)),
         "inkBleed":       bool(data.get("inkBleed",       False)),
         "pageTear":       bool(data.get("pageTear",       False)),
         "ghostWriter":    bool(data.get("ghostWriter",    False)),
@@ -826,7 +1101,6 @@ def on_chat_message(data: dict):
         "avatarMissing":  bool(data.get("avatarMissing",  False)),
         "roughCut":       bool(data.get("roughCut",       False)),
         "negativeSpace":  bool(data.get("negativeSpace",  False)),
-        "granizo":        bool(data.get("granizo",        False)),
         "streetDog":      bool(data.get("streetDog",      False)),
         "graveEntrance":  bool(data.get("graveEntrance",  False)),
         "title":          _sanitise(data.get("title", ""), max_len=64) or None,
@@ -1051,13 +1325,13 @@ def on_room_command(data: dict):
         'vhs', 'quiniela', 'sepia', 'font_wingdings', 'zoom_focus',
         'silhouette', 'fileteado', 'win_tab', 'low_res',
         'page_flip', 'subte', 'void', 'mirror', 'weight',
-        'heavy_rain', 'ink_bleed', 'page_tear',
+        'ink_bleed', 'page_tear',
         'ghost_writer', 'alt_f4', 'inner_monologue', 'zoom_dramatic',
         # batch 2
         'screensaver', 'pixel_sort', 'direct_x', 'shred', 'spotlight',
         'gutters', 'blind_shadows', 'coinflip', 'desktop_holes',
         'avatar_missing', 'rough_cut', 'trial_expired', 'register',
-        'negative_space', 'granizo', 'bondi_full',
+        'negative_space', 'bondi_full',
         # batch 3 — props & cinematic
         'obelisco', 'bondi_exit', 'piquete', 'shun',
         # fusion
@@ -1099,6 +1373,10 @@ def on_room_command(data: dict):
         #            Win95 gags and the sparkle emote (any room)
         'neon_flicker', 'hack', 'glug', 'poster', 'sirena', 'pop3',
         'clippy', 'hourglass', 'sparkle',
+        # batch 18 — room weather (state lives in _active_weather)
+        'rain', 'rainall', 'storm', 'wind',
+        'snow', 'hail', 'sun', 'fog', 'frost',
+        'wisps', 'fireflies', 'meteors', 'eclipse', 'clearweather',
     }
 
     sid, user = _joined_user()
@@ -1180,7 +1458,7 @@ def on_room_command(data: dict):
     elif cmd_type in (
         'vhs', 'sepia', 'font_wingdings', 'zoom_focus', 'silhouette',
         'fileteado', 'low_res', 'void', 'mirror', 'weight',
-        'heavy_rain', 'ink_bleed', 'page_tear',
+        'ink_bleed', 'page_tear',
         'ghost_writer', 'inner_monologue', 'zoom_dramatic',
     ):
         payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
@@ -1207,7 +1485,7 @@ def on_room_command(data: dict):
     elif cmd_type in (
         'screensaver', 'pixel_sort', 'direct_x', 'gutters',
         'blind_shadows', 'desktop_holes', 'avatar_missing', 'rough_cut',
-        'negative_space', 'granizo',
+        'negative_space',
     ):
         payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
         payload["active"] = bool(data.get("active", True))
@@ -1558,6 +1836,18 @@ def on_room_command(data: dict):
         payload["nick"]   = _sanitise(data.get("nick", ""), max_len=32)
         payload["active"] = bool(data.get("active", True))
 
+    # /rain /rainall /storm /wind — room weather, any room. The SERVER decides what the
+    # command does (toggle / replace — see _weather_apply) and broadcasts the resulting
+    # state in the payload; the clients just draw it. Too-quick changes are refused.
+    elif cmd_type in ("rain", "rainall", "storm", "wind", "snow", "hail", "sun", "fog", "frost",
+                      "wisps", "fireflies", "meteors", "eclipse", "clearweather"):
+        snap = _weather_apply(room, cmd_type)
+        if snap is None:
+            emit("system_msg", {"text": "⏳ The weather just changed — give it a moment."})
+            return
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+        payload.update(snap)             # precip / wind / sky / timed / remainingMs
+
     # /poster — La Pared; nick + capped text. Empty text is dropped.
     elif cmd_type == "poster":
         payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
@@ -1657,6 +1947,123 @@ def _release_event(room: str, nick: str) -> None:
             return
         _active_events.pop(room, None)
     socketio.emit("global_event_mode", {"nick": nick, "room": room, "active": False}, to=room)
+
+
+def _room_counts() -> dict:
+    """{room name: number of sessions currently in it}. Sessions with no room
+    (between an explicit "leave" and the following "join") are not counted.
+    Rooms with nobody inside are simply absent (the client treats that as 0)."""
+    counts: dict = {}
+    with _users_lock:
+        for u in online_users.values():
+            r = u.get("room")
+            if r:
+                counts[r] = counts.get(r, 0) + 1
+    return counts
+
+
+def _public_rooms() -> list:
+    """Custom rooms as sent to clients, oldest first. creatorSid is NEVER sent."""
+    with _custom_rooms_lock:
+        rooms = sorted(_custom_rooms.values(), key=lambda r: r["createdAt"])
+        return [{
+            "name":           r["name"],
+            "topic":          r["topic"],
+            "creator":        r["creator"],
+            "lockedBg":       r["lockedBg"],
+            "panelBg":        r["panelBg"],
+            "allowedAvatars": r["allowedAvatars"],
+        } for r in rooms]
+
+
+def _broadcast_room_list() -> None:
+    """Push the custom-room list to ALL clients (live Room List updates)."""
+    socketio.emit("room_list", {"rooms": _public_rooms()})
+
+
+def _validate_room_fields(data, require_name: bool):
+    """Validate/normalise the editable room fields from a client payload.
+    Returns (fields, None) or (None, "human readable error")."""
+    if not isinstance(data, dict):
+        return None, "Invalid request."
+    fields: dict = {}
+
+    if require_name:
+        name = _sanitise(data.get("name", ""), 64).lstrip("#").replace(" ", "")
+        if not (CUSTOM_ROOM_NAME_MIN <= len(name) <= CUSTOM_ROOM_NAME_MAX) or not name.isalnum():
+            return None, (f"Room names must be {CUSTOM_ROOM_NAME_MIN}–{CUSTOM_ROOM_NAME_MAX} "
+                          f"letters or digits (no spaces or symbols).")
+        fields["name"] = name
+
+    topic = _sanitise(data.get("topic", ""), CUSTOM_ROOM_TOPIC_MAX)
+    fields["topic"] = topic or "No topic set"
+
+    locked = bool(data.get("lockedBg", False))
+    bg     = data.get("panelBg")
+    bg     = bg if isinstance(bg, str) and _ID_RE.match(bg) else None
+    if locked and not bg:
+        return None, "Pick a background for a locked room."
+    fields["lockedBg"] = locked
+    fields["panelBg"]  = bg
+
+    av = data.get("allowedAvatars")
+    if av is None:
+        fields["allowedAvatars"] = None
+    elif isinstance(av, list):
+        clean = []
+        for a in av[:CUSTOM_ROOM_AVATARS_MAX]:
+            if isinstance(a, str) and _ID_RE.match(a) and a not in clean:
+                clean.append(a)
+        fields["allowedAvatars"] = clean or None
+    else:
+        return None, "Invalid avatar list."
+    return fields, None
+
+
+def _ensure_room_sweeper() -> None:
+    """Start the empty-room sweeper if it is not running. It stops itself when
+    no custom rooms are left. Started lazily (first create_room) so it also works
+    under gunicorn, where the __main__ block below never runs."""
+    global _room_sweeper_running
+    with _custom_rooms_lock:
+        if _room_sweeper_running:
+            return
+        _room_sweeper_running = True
+    socketio.start_background_task(_room_sweeper)
+
+
+def _room_sweeper() -> None:
+    """Delete custom rooms that have been empty for CUSTOM_ROOM_EMPTY_TTL."""
+    global _room_sweeper_running
+    while True:
+        socketio.sleep(CUSTOM_ROOM_SWEEP_EVERY)
+        counts  = _room_counts()          # takes _users_lock — never nest inside the rooms lock
+        now     = time.time()
+        removed = []
+        with _custom_rooms_lock:
+            for key, r in list(_custom_rooms.items()):
+                if counts.get(r["name"], 0) > 0:
+                    r["emptySince"] = None
+                elif r["emptySince"] is None:
+                    r["emptySince"] = now
+                elif now - r["emptySince"] >= CUSTOM_ROOM_EMPTY_TTL:
+                    del _custom_rooms[key]
+                    removed.append(r["name"])
+            stop = not _custom_rooms
+            if stop:
+                _room_sweeper_running = False
+        if removed:
+            print(f"[rooms] removed empty custom room(s): {', '.join(removed)}")
+            _broadcast_room_list()
+        if stop:
+            return
+
+
+def _broadcast_room_counts() -> None:
+    """Push the head-count of every room to ALL connected clients, so an open
+    Room List dialog updates live. (socketio.emit with no target = broadcast;
+    the bare emit() used elsewhere would reach only the current sender.)"""
+    socketio.emit("room_counts", _room_counts())
 
 
 def _broadcast_user_list(room: str) -> None:
