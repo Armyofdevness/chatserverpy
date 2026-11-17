@@ -26,6 +26,7 @@ import collections
 import hmac
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -36,6 +37,8 @@ from urllib.parse import urlsplit
 
 from flask import Flask, send_from_directory
 from flask_socketio import SocketIO, emit, join_room, leave_room
+
+from npc_lines import NPC_AVATARS, NPC_OWN_LINES, NPC_SHARED_LINES   # /npc: avatares y frases
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HISTORY_FILE  = Path("history.json")
@@ -141,7 +144,16 @@ ROOM_EXCLUSIVE_COMMANDS = {
     "poster":       "La Pared",
     "sirena":       "La Pared",
     "pop3":         "TechTalk96",
+    "lab_press":    "Laboratorio",      # consola del Laboratorio (js/laboratory.js)
+    "casa_door":    "Casa",             # puertas de la sala Casa (js/casa.js)
 }
+
+# ── Lote 19 (/throw /serenade /rps /cronica …) ───────────────────────────────
+THROW_ITEMS  = ("🍅", "🥒", "🥦")
+RPS_MOVES    = ("piedra", "papel", "tijera")
+RPS_BEATS    = {"piedra": "tijera", "papel": "piedra", "tijera": "papel"}   # la clave le gana al valor
+CRONICA_SECS = 7
+_cronica_last: dict[str, float] = {}      # {sala: timestamp} para no solapar Crónicas
 
 # Per-sid deques: { sid: deque([timestamp, ...]) }
 # Written / read only inside the rate-limit helper (protected by GIL for CPython;
@@ -173,7 +185,7 @@ BUILTIN_ROOM_NAMES = (
     "ComicCafe", "TechTalk96", "GamersZone", "Argentinos", "RainyCafe",
     "TranquilBoat", "Cemetery", "Starship", "Godzilla's Attack", "Biblioteca",
     "Subte", "Estadio", "Arcades", "THE DUNGEON", "La Pared",
-    "El Fondo del Mar", "Cyberpunk", "general",
+    "El Fondo del Mar", "Cyberpunk", "Open Field", "Antartida", "Tropical Beach", "Laboratorio", "Casa", "general",
 )
 
 def _room_key(name: str) -> str:
@@ -423,14 +435,21 @@ WEATHER_PRECIP_CMDS   = {        # command → (precipitation, timed?)
 }
 WEATHER_SKY_CMDS = ("sun", "fog", "frost")   # command == the sky value it sets
 # Independent ambience toggles (a SET, they stack with any precipitation / wind / sky):
-#   /wisps /fireflies /meteors /eclipse.  An eclipse and the sun exclude each other.
-WEATHER_FX_CMDS = ("wisps", "fireflies", "meteors", "eclipse")
+#   /wisps /fireflies /meteors /eclipse /aurora /rainbow /tremble.  An eclipse and the sun exclude each other.
+WEATHER_FX_CMDS = ("wisps", "fireflies", "meteors", "eclipse", "fullmoon", "aurora", "rainbow", "tremble", "flood")
 # Rooms whose ambience starts on by itself: the first person to join an EMPTY room finds this
 # weather already running (it is not announced — see "ambient" below). It is ordinary weather
 # afterwards: any user can toggle it off, and it stays off until the room has been empty and
 # somebody joins it again. Edit this table to give another room a default.
 WEATHER_ROOM_DEFAULTS = {
     "Cemetery": {"sky": "fog"},
+    "Open Field": {"fx": {"fireflies"}},
+}
+# Rooms with a recurring server-driven effect: every `every` seconds the effect is switched ON for
+# `for` seconds, then OFF again — only while somebody is in the room (see _weather_scheduler).
+# Open Field: a meteor shower every 3.5 minutes.
+WEATHER_ROOM_SCHEDULES = {
+    "Open Field": [{"fx": "meteors", "every": 210, "for": 25}],
 }
 _weather_seeded: set[str] = set()      # rooms already seeded during their current occupancy
 _active_weather: dict[str, dict] = {}
@@ -441,12 +460,133 @@ _weather_lock = threading.Lock()
 def _weather_seed_locked(room: str) -> None:
     """Start the room's default ambience, once per occupancy. Caller holds _weather_lock."""
     base = WEATHER_ROOM_DEFAULTS.get(room)
-    if not base or room in _weather_seeded:
+    hook = _WEATHER_SEED_HOOKS.get(room)
+    if (not base and hook is None) or room in _weather_seeded:
         return
     _weather_seeded.add(room)
-    if room not in _active_weather:
-        _active_weather[room] = {"precip": None, "wind": False, "sky": None, "until": None,
-                                 "ambient": True, **base}
+    if base and room not in _active_weather:
+        st = {"precip": None, "wind": False, "sky": None, "until": None, "ambient": True, **base}
+        st["fx"] = set(base.get("fx") or ())      # copy: never share the template's set between occupancies
+        _active_weather[room] = st
+    if hook is not None:
+        hook(room)                                # random starting weather (see below)
+
+
+# ── Random room weather (Antartida / Tropical Beach) ─────────────────────────
+# Server-driven, "ambient" weather: it counts as the room's own default (not announced as
+# somebody's command). Once a user takes charge with a weather command the random cycle leaves
+# the room alone until it has been empty and is joined again.
+#   Antartida     every ANT_CYCLE_SECS (and when the room is first entered) roll once:
+#                   15% hail · 50% snow · 35% clear. While someone is on the Event Mode stage
+#                   the cycle pauses; STARTING the stage has a 50% chance to turn it into a
+#                   snowstorm (snow + wind + fog), whatever the weather was.
+#   Tropical Beach  every time somebody enters: 25% chance a /storm starts (if none is running).
+ANTARTIDA_ROOM           = "Antartida"
+TBEACH_ROOM              = "Tropical Beach"
+ANT_CYCLE_SECS           = 4 * 60
+ANT_HAIL_P               = 0.15
+ANT_SNOW_P               = 0.50
+ANT_STORM_ON_STAGE_P     = 0.50
+TBEACH_STORM_ON_JOIN_P   = 0.25
+ROOM_WEATHER_CYCLE_SECS  = {ANTARTIDA_ROOM: ANT_CYCLE_SECS}
+
+# Tropical Beach's background alternates every 10 min on the WALL CLOCK (js/beach-rooms.js:
+# floor(now / 10 min) % 2 -> even = tbeach.webp, odd = tbeach2.webp). The sky follows it:
+#   odd  (tbeach2.webp) -> /sun on          even (tbeach.webp) -> /fullmoon on
+# The sun/moon is applied when someone enters (first time) and whenever the phase flips; after that
+# a user can still change it (/clearweather, /sun...) until the next flip.
+TBEACH_PHASE_MS = 10 * 60 * 1000
+_tbeach_phase_applied: dict = {}          # room -> phase last applied
+
+
+def _tbeach_phase() -> int:
+    return int(time.time() * 1000 // TBEACH_PHASE_MS) % 2
+
+
+def _tbeach_sky_locked(room: str, force: bool = False):
+    """Make the sky match the background phase. Caller holds _weather_lock.
+    Returns (snapshot, phase_changed_msg) or (None, None) when nothing was applied."""
+    phase = _tbeach_phase()
+    if not force and _tbeach_phase_applied.get(room) == phase:
+        return None, None
+    first = room not in _tbeach_phase_applied
+    _tbeach_phase_applied[room] = phase
+    st = _active_weather.get(room)
+    if st is None:
+        st = _active_weather[room] = {"precip": None, "wind": False, "sky": None,
+                                      "fx": set(), "until": None, "ambient": True}
+    fx = st.setdefault("fx", set())
+    if phase == 1:                         # tbeach2 -> sun
+        fx.discard("fullmoon")
+        fx.discard("eclipse")
+        st["sky"] = "sun"
+        msg = "*** 🌞 The sun is high over the beach."
+    else:                                  # tbeach -> full moon
+        fx.add("fullmoon")
+        if st.get("sky") == "sun":
+            st["sky"] = None
+        msg = "*** 🌕 A full moon rises over the beach."
+    return _weather_snapshot_locked(room), (None if first else msg)
+
+
+def _weather_put_locked(room: str, updates: dict, ambient=True) -> dict:
+    """Set weather fields directly (no toggling, no cooldown). ambient=None keeps the current
+    flag. Caller holds _weather_lock. Returns the new snapshot."""
+    st = _active_weather.get(room)
+    if st is None:
+        st = _active_weather[room] = {"precip": None, "wind": False, "sky": None,
+                                      "fx": set(), "until": None, "ambient": True}
+    st.setdefault("fx", set())
+    st.update(updates)
+    if "precip" in updates:
+        st["until"] = None
+    if ambient is not None:
+        st["ambient"] = ambient
+    if not st["precip"] and not st["wind"] and not st.get("sky") and not st["fx"]:
+        _active_weather.pop(room, None)
+    return _weather_snapshot_locked(room)
+
+
+def _antartida_roll_locked(room: str):
+    """One roll of Antartida's weather. None if a user has taken charge of it."""
+    st = _active_weather.get(room)
+    if st and not st.get("ambient"):
+        return None
+    r = random.random()
+    precip = "hail" if r < ANT_HAIL_P else ("snow" if r < ANT_HAIL_P + ANT_SNOW_P else None)
+    return _weather_put_locked(room, {"precip": precip, "wind": False, "sky": None}, True)
+
+
+_WEATHER_SEED_HOOKS = {ANTARTIDA_ROOM: _antartida_roll_locked}
+
+
+def _weather_cycle(room: str):
+    """Re-roll a cycling room. Returns the new snapshot if the weather actually changed."""
+    hook = _WEATHER_SEED_HOOKS.get(room)
+    if hook is None:
+        return None
+    with _weather_lock:
+        _weather_seed_locked(room)
+        before = _weather_snapshot_locked(room)
+        snap = hook(room)
+    if snap is None:
+        return None
+    key = lambda x: (x["precip"], x["wind"], x["sky"])
+    return snap if key(snap) != key(before) else None
+
+
+def _antartida_stage_storm(room: str) -> None:
+    """The stage just started in Antartida: 50% chance of a snowstorm (snow + wind + fog)."""
+    if random.random() >= ANT_STORM_ON_STAGE_P:
+        return
+    with _weather_lock:
+        _weather_seed_locked(room)
+        before = _weather_snapshot_locked(room)
+        if before["precip"] == "snow" and before["wind"] and before["sky"] == "fog":
+            return                                          # already a snowstorm
+        snap = _weather_put_locked(room, {"precip": "snow", "wind": True, "sky": "fog"}, None)
+    socketio.emit("weather_state", snap, to=room)
+    socketio.emit("system_msg", {"text": "*** ❄️🌬️ A snowstorm is rolling in over Antartida!"}, to=room)
 
 
 def _weather_snapshot_locked(room: str) -> dict:
@@ -495,12 +635,13 @@ def _weather_apply(room: str, cmd: str):
                 st["fx"].discard(cmd)
             else:
                 st["fx"].add(cmd)
-                if cmd == "eclipse" and st.get("sky") == "sun":
-                    st["sky"] = None                               # the moon covers the sun
+                if cmd in ("eclipse", "fullmoon") and st.get("sky") == "sun":
+                    st["sky"] = None                               # the moon covers the sun / it is night
         elif cmd in WEATHER_SKY_CMDS:
             st["sky"] = None if st.get("sky") == cmd else cmd      # same again → off, other → replace
             if st["sky"] == "sun":
                 st["fx"].discard("eclipse")
+                st["fx"].discard("fullmoon")
         else:
             want, timed = WEATHER_PRECIP_CMDS[cmd]
             if st["precip"] == want and bool(st["until"]) == timed:
@@ -514,6 +655,95 @@ def _weather_apply(room: str, cmd: str):
         return _weather_snapshot_locked(room)
 
 
+def _weather_scheduled_fx(room: str, kind: str, on: bool):
+    """Switch one ambience fx on/off for the room's scheduler. Returns the new snapshot, or None
+    if nothing changed. Unlike _weather_apply it ignores the cooldown and leaves "ambient" alone."""
+    with _weather_lock:
+        _weather_seed_locked(room)
+        _weather_snapshot_locked(room)                       # lazy-expire first
+        st = _active_weather.get(room)
+        if on:
+            if st is None:
+                st = _active_weather.setdefault(
+                    room, {"precip": None, "wind": False, "sky": None, "fx": set(), "until": None})
+            fx = st.setdefault("fx", set())
+            if kind in fx:
+                return None
+            fx.add(kind)
+        else:
+            if st is None or kind not in (st.get("fx") or ()):
+                return None
+            st["fx"].discard(kind)
+            if not st["precip"] and not st["wind"] and not st.get("sky") and not st["fx"]:
+                _active_weather.pop(room, None)
+        return _weather_snapshot_locked(room)
+
+
+_weather_scheduler_running = False
+_weather_scheduler_flag = threading.Lock()
+
+
+def _ensure_weather_scheduler() -> None:
+    """Start the recurring-effect loop once (lazily, so it also works under gunicorn)."""
+    global _weather_scheduler_running
+    with _weather_scheduler_flag:
+        if _weather_scheduler_running:
+            return
+        _weather_scheduler_running = True
+    socketio.start_background_task(_weather_scheduler)
+
+
+def _weather_scheduler() -> None:
+    """Drive WEATHER_ROOM_SCHEDULES. A room's clock only runs while it is occupied; it restarts
+    from a full interval when the room empties and is joined again."""
+    state: dict = {}                      # (room, fx) -> {"next": ts, "off": ts|None}
+    cycle_next: dict = {}                 # room -> ts of its next random-weather roll
+    while True:
+        socketio.sleep(5)
+        counts = _room_counts()
+        now = time.time()
+        for room, every in ROOM_WEATHER_CYCLE_SECS.items():          # random weather cycles
+            if counts.get(room, 0) <= 0:
+                cycle_next.pop(room, None)
+                continue
+            if now < cycle_next.setdefault(room, now + every):
+                continue
+            cycle_next[room] = now + every
+            with _event_lock:
+                staged = room in _active_events
+            if staged:                                                # the stage owns the weather
+                continue
+            snap = _weather_cycle(room)
+            if snap is not None:
+                socketio.emit("weather_state", snap, to=room)
+        if counts.get(TBEACH_ROOM, 0) > 0:                           # sun <-> full moon with the background
+            with _weather_lock:
+                _weather_seed_locked(TBEACH_ROOM)
+                snap, msg = _tbeach_sky_locked(TBEACH_ROOM)
+            if snap is not None and msg:
+                socketio.emit("weather_state", snap, to=TBEACH_ROOM)
+                socketio.emit("system_msg", {"text": msg}, to=TBEACH_ROOM)
+        for room, items in WEATHER_ROOM_SCHEDULES.items():
+            for it in items:
+                key, kind = (room, it["fx"]), it["fx"]
+                if counts.get(room, 0) <= 0:
+                    state.pop(key, None)
+                    continue
+                s = state.setdefault(key, {"next": now + it["every"], "off": None})
+                snap, on = None, False
+                if s["off"] is None and now >= s["next"]:
+                    snap = _weather_scheduled_fx(room, kind, True)
+                    on = True
+                    s["off"], s["next"] = now + it["for"], now + it["every"]
+                elif s["off"] is not None and now >= s["off"]:
+                    snap = _weather_scheduled_fx(room, kind, False)
+                    s["off"] = None
+                if snap is not None:
+                    socketio.emit("room_command",
+                                  {"type": kind, "room": room, "fromNick": room,
+                                   "nick": "The night sky", **snap}, to=room)
+
+
 def _weather_clear_if_empty(room) -> None:
     """Forget a room's weather once nobody is in it any more."""
     if not room:
@@ -525,6 +755,7 @@ def _weather_clear_if_empty(room) -> None:
             _active_weather.pop(room, None)
             _weather_last.pop(room, None)
             _weather_seeded.discard(room)
+            _tbeach_phase_applied.pop(room, None)
 
 
 def _try_panel_upgrade(msg: dict) -> bool:
@@ -753,6 +984,11 @@ def on_disconnect():
 
     room = user.get("room") if user else None
     _weather_clear_if_empty(room)          # (the user is already out of online_users)
+    _npc_release(room, sid)                # their NPCs go with them; an empty room forgets all of them
+    _mando_release(room, sid)              # their remote controls go too; an empty room forgets all of them
+    _lab_clear_if_empty(room)
+    _casa_clear_if_empty(room)
+    _gato_release(room, sid)               # su gato se va con él; una sala vacía olvida todos
     if user and room:                      # room is None after an explicit "leave"
         leave_room(room)
         _release_event(room, user["nick"])
@@ -805,6 +1041,11 @@ def on_join(data: dict):
         leave_room(prev_room)
         _release_event(prev_room, prev_nick)
         _weather_clear_if_empty(prev_room)
+        _npc_release(prev_room, sid)
+        _mando_release(prev_room, sid)
+        _lab_clear_if_empty(prev_room)
+        _casa_clear_if_empty(prev_room)
+        _gato_release(prev_room, sid)
         socketio.emit(
             "system_msg",
             {"text": f"*** {prev_nick} has left #{prev_room}"},
@@ -832,10 +1073,28 @@ def on_join(data: dict):
 
     # Same for the room's weather: a joiner (or a client that just switched rooms) gets the
     # current state — or a clean slate — straight away.
+    storm_snap = None
     with _weather_lock:
         _weather_seed_locked(room)
+        if room == TBEACH_ROOM:
+            _tbeach_sky_locked(room)                                # sun / full moon for the current background
+        if room == TBEACH_ROOM and random.random() < TBEACH_STORM_ON_JOIN_P:
+            cur = _active_weather.get(room)
+            if not cur or cur.get("precip") != "storm":
+                storm_snap = _weather_put_locked(room, {"precip": "storm"}, None)
         weather_now = _weather_snapshot_locked(room)
     emit("weather_state", weather_now)
+    emit("npc_state", {"npcs": _npc_snapshot(room)})                # active /npc NPCs (or a clean slate)
+    emit("mando_state", {"mandos": _mando_snapshot(room)})          # active /mando remotes (or a clean slate)
+    if room == LAB_ROOM:
+        emit("lab_state", _lab_snapshot(room))                      # Laboratorio: cooldowns restantes + último uso
+    if room == CASA_ROOM:
+        emit("casa_scene", {"scene": _casa_scene(room)})            # Casa: escena vigente (o living)
+    if storm_snap is not None:                                      # tell everyone already inside
+        socketio.emit("weather_state", storm_snap, to=room, skip_sid=sid)
+        socketio.emit("system_msg", {"text": "*** ⛈️ A tropical storm rolls in over the beach!"}, to=room)
+    if room in WEATHER_ROOM_SCHEDULES or room in ROOM_WEATHER_CYCLE_SECS or room == TBEACH_ROOM:
+        _ensure_weather_scheduler()
 
     # Broadcast updated user list to everyone in the new room
     _broadcast_user_list(room)
@@ -873,6 +1132,11 @@ def on_leave(data=None):
     # gap are dropped, and on_join will not announce the departure a second time.
     user["room"] = None
     _weather_clear_if_empty(room)
+    _npc_release(room, sid)
+    _mando_release(room, sid)
+    _lab_clear_if_empty(room)
+    _casa_clear_if_empty(room)
+    _gato_release(room, sid)
 
     emit(
         "system_msg",
@@ -1204,6 +1468,10 @@ def on_event_mode(data: dict):
                 _active_events.pop(room, None)
                 initiator = None   # cleared — broadcast off to everyone
 
+    # Antartida: starting the stage may whip the weather up into a snowstorm
+    if active and room == ANTARTIDA_ROOM:
+        _antartida_stage_storm(room)
+
     # ── Event announcement (excludes sender — they handle their own UI) ────────
     emit(
         "event_mode",
@@ -1362,7 +1630,7 @@ def on_room_command(data: dict):
         # batch 12 — room-exclusive commands
         'rush_hour',
         # batch 13 — any-room commands
-        'beam',
+        'beam', 'teleport', 'smoke',
         # batch 14 — La Pared
         'graffiti',
         # batch 15 — image / GIF prop
@@ -1377,6 +1645,22 @@ def on_room_command(data: dict):
         'rain', 'rainall', 'storm', 'wind',
         'snow', 'hail', 'sun', 'fog', 'frost',
         'wisps', 'fireflies', 'meteors', 'eclipse', 'clearweather',
+        'aurora', 'rainbow', 'tremble', 'flood', 'fullmoon',
+        # batch 19
+        'throw', 'serenade', 'idea', 'hearts', 'rps', 'eightball', 'sorteo',
+        'ding', 'theend', 'afk', 'nowplaying', 'fly', 'cronica',
+        # batch 20 — /npc (temporary NPCs; state lives in _npcs)
+        'npc', 'npc_say',
+        # batch 21 — /mando (remote control; state lives in _mandos)
+        'mando', 'mando_press',
+        # batch 22 — Laboratorio: apretar un botón de la consola (state lives in _lab)
+        'lab_press',
+        # batch 23 — /gatocallejero (state lives in _gatos)
+        'gatocallejero',
+        # batch 24 — /portal (efecto visual; el servidor valida que el avatar de la sesión sea mágico)
+        'portal',
+        # batch 25 — Casa: abrir una puerta cambia la escena de toda la sala (state lives in _casa)
+        'casa_door',
     }
 
     sid, user = _joined_user()
@@ -1742,6 +2026,16 @@ def on_room_command(data: dict):
     elif cmd_type == "beam":
         payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
 
+    # /teleport — any room; the /beam effect played backwards (the avatar
+    # dematerializes and stays gone from that panel); nick only.
+    elif cmd_type == "teleport":
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+
+    # /smoke (/humo) — any room; ninja smoke bomb on the sender's avatar
+    # (purely client-side visual); nick only.
+    elif cmd_type == "smoke":
+        payload["nick"] = _sanitise(data.get("nick", ""), max_len=32)
+
     # /graffiti — La Pared; nick + capped text + colour from a fixed allow-list.
     # Empty text is dropped (nothing to spray).
     elif cmd_type == "graffiti":
@@ -1840,7 +2134,8 @@ def on_room_command(data: dict):
     # command does (toggle / replace — see _weather_apply) and broadcasts the resulting
     # state in the payload; the clients just draw it. Too-quick changes are refused.
     elif cmd_type in ("rain", "rainall", "storm", "wind", "snow", "hail", "sun", "fog", "frost",
-                      "wisps", "fireflies", "meteors", "eclipse", "clearweather"):
+                      "wisps", "fireflies", "meteors", "eclipse", "clearweather",
+                      "aurora", "rainbow", "tremble", "flood", "fullmoon"):
         snap = _weather_apply(room, cmd_type)
         if snap is None:
             emit("system_msg", {"text": "⏳ The weather just changed — give it a moment."})
@@ -1854,6 +2149,200 @@ def on_room_command(data: dict):
         payload["text"] = _sanitise(data.get("text", ""), max_len=60)
         if not payload["text"]:
             return
+
+    # ── batch 19 ──────────────────────────────────────────────────────────────
+    # Dos personas: el objetivo debe estar en la sala. El servidor tira los dados
+    # (item / jugadas) para que todos los clientes vean lo mismo.
+    elif cmd_type in ("throw", "serenade", "rps"):
+        target = _resolve_nick_in_room(room, data.get("target", ""))
+        if not target or target.lower() == actor.lower():
+            return
+        payload["initiator"] = actor
+        payload["target"]    = target
+        if cmd_type == "throw":
+            payload["item"] = random.choice(THROW_ITEMS)
+        elif cmd_type == "rps":
+            a, b = random.choice(RPS_MOVES), random.choice(RPS_MOVES)
+            payload["a"], payload["b"] = a, b
+            payload["winner"] = "" if a == b else (actor if RPS_BEATS[a] == b else target)
+
+    # Solo el nick
+    elif cmd_type in ("idea", "hearts", "ding", "theend", "fly"):
+        payload["nick"] = actor
+
+    elif cmd_type == "afk":
+        payload["nick"]   = actor
+        payload["active"] = bool(data.get("active", True))
+        payload["reason"] = _sanitise(data.get("reason", ""), max_len=40)
+
+    elif cmd_type == "nowplaying":
+        payload["nick"] = actor
+        payload["text"] = _sanitise(data.get("text", ""), max_len=60)
+        if not payload["text"]:
+            return
+
+    elif cmd_type == "eightball":
+        payload["nick"]     = actor
+        payload["question"] = _sanitise(data.get("question", ""), max_len=80)
+        if not payload["question"]:
+            return
+        payload["answer"] = random.choice(("SÍ", "NO"))
+
+    elif cmd_type == "sorteo":
+        with _users_lock:
+            pool = [u["nick"] for u in online_users.values()
+                    if u.get("room") == room and not u.get("bot")]
+        if not pool:
+            return
+        payload["nick"]   = actor
+        payload["winner"] = random.choice(pool)
+
+    elif cmd_type == "cronica":
+        now = time.time()
+        if now - _cronica_last.get(room, 0.0) < CRONICA_SECS + 1:
+            emit("system_msg", {"text": "📺 Crónica TV ya está al aire — esperá un momento."})
+            return
+        _cronica_last[room] = now
+        payload["nick"] = actor
+
+    # batch 20 — /npc: summon a temporary NPC / click on one. All validation is here, never the client's.
+    elif cmd_type == "npc":
+        with _npc_lock:
+            bucket = _npcs.setdefault(room, {})
+            now = time.time()
+            for nid in [k for k, n in bucket.items() if n["expires"] <= now]:   # (safety net; the timer normally did it)
+                bucket.pop(nid, None)
+            if any(n["owner_sid"] == sid for n in bucket.values()):
+                emit("system_msg", {"text": "🧍 Ya tenés un NPC activo. Esperá a que se vaya (dura 30 s)."})
+                return
+            if len(bucket) >= NPC_MAX_PER_ROOM:
+                emit("system_msg", {"text": f"🧍 Ya hay {NPC_MAX_PER_ROOM} NPC en la sala. Esperá a que se vaya alguno."})
+                return
+            npc_id = uuid.uuid4().hex[:8]
+            avatar = random.choice(NPC_AVATARS)
+            bucket[npc_id] = {"id": npc_id, "owner": actor, "owner_sid": sid, "avatar": avatar,
+                              "expires": now + NPC_TTL_SECS, "used": set(), "last_text": None, "last_click": 0.0}
+        socketio.start_background_task(_npc_expire_task, room, npc_id, NPC_TTL_SECS)
+        payload.update({"id": npc_id, "avatarId": avatar, "owner": actor, "ttl": NPC_TTL_SECS * 1000})
+
+    elif cmd_type == "npc_say":
+        npc_id = _sanitise(data.get("id", ""), max_len=16)
+        now = time.time()
+        with _npc_lock:
+            npc = _npcs.get(room, {}).get(npc_id)
+            if npc is None or npc["expires"] <= now:
+                return                                           # no existe / ya venció: se ignora
+            if now - npc["last_click"] < NPC_CLICK_COOLDOWN:
+                return                                           # cooldown de 5 s por NPC: se ignora
+            text, emotion = _npc_pick_line(npc)
+            npc["used"].add(text)
+            npc["last_text"], npc["last_click"] = text, now
+        payload.update({"id": npc_id, "text": text, "emotion": emotion})
+
+    # batch 21 — /mando: summon a remote / press its button. Owner, limits, cooldown, id and victim are all decided here.
+    elif cmd_type == "mando":
+        with _mando_lock:
+            bucket = _mandos.setdefault(room, {})
+            now = time.time()
+            for mid in [k for k, m in bucket.items() if m["expires"] <= now]:   # (safety net; the timer normally did it)
+                bucket.pop(mid, None)
+            if any(m["owner_sid"] == sid for m in bucket.values()):
+                emit("system_msg", {"text": "🎛️ Ya tenés un mando activo. Esperá a que desaparezca."})
+                return
+            if len(bucket) >= MANDO_MAX_PER_ROOM:
+                emit("system_msg", {"text": f"🎛️ Ya hay {MANDO_MAX_PER_ROOM} mandos en la sala. Esperá a que desaparezca alguno."})
+                return
+            mando_id = uuid.uuid4().hex[:8]
+            bucket[mando_id] = {"id": mando_id, "owner": actor, "owner_sid": sid,
+                                "expires": now + MANDO_TTL_SECS, "last_press": 0.0}
+        socketio.start_background_task(_mando_expire_task, room, mando_id, MANDO_TTL_SECS)
+        payload.update({"id": mando_id, "owner": actor, "ttl": MANDO_TTL_SECS * 1000})
+
+    elif cmd_type == "mando_press":
+        mando_id = _sanitise(data.get("id", ""), max_len=16)
+        now = time.time()
+        with _mando_lock:
+            mando = _mandos.get(room, {}).get(mando_id)
+            if mando is None or mando["expires"] <= now:
+                return                                           # no existe / ya venció: se ignora
+            if now - mando["last_press"] < MANDO_COOLDOWN:
+                return                                           # cooldown por mando: se ignora
+            mando["last_press"] = now
+        with _users_lock:                                        # víctima: humano de ESTA sala (incluye a quien apretó)
+            pool = [u["nick"] for u in online_users.values() if u.get("room") == room and not u.get("bot")]
+        if not pool:
+            pool = [actor]
+        payload.update({"type": "mando_zap", "id": mando_id, "presser": actor, "victim": random.choice(pool)})
+
+    # batch 22 — Laboratorio: apretar un botón de la consola. Sala = la de la SESIÓN (ya validada por
+    # ROOM_EXCLUSIVE_COMMANDS); del payload solo se lee el id, contra una lista fija. Si no corresponde, se ignora.
+    elif cmd_type == "lab_press":
+        btn_id = _sanitise(data.get("id", ""), max_len=16)
+        spec = LAB_BUTTONS.get(btn_id)
+        if spec is None:
+            return
+        now = time.time()
+        with _lab_lock:
+            st = _lab.setdefault(room, {"ready": {}, "global": 0.0, "last": None})
+            if now < st["global"] or now < st["ready"].get(btn_id, 0.0):
+                return                                           # enfriamiento global (sala) o del botón: se ignora
+            st["global"] = now + LAB_GLOBAL_COOLDOWN
+            st["ready"][btn_id] = now + spec["cooldown"]
+            st["last"] = {"nick": actor, "id": btn_id, "ts": now}
+        payload.update({"type": "lab_fx", "id": btn_id, "presser": actor})
+        if spec["scope"] == "one":
+            with _users_lock:                                    # víctima: humano de ESTA sala (incluye a quien apretó)
+                pool = [u["nick"] for u in online_users.values() if u.get("room") == room and not u.get("bot")]
+            payload["victim"] = random.choice(pool or [actor])
+        socketio.emit("room_command", payload, to=room)
+        socketio.emit("lab_state", _lab_snapshot(room), to=room)
+        print(f"[room_command] lab_press {btn_id} by {actor} in #{room}")
+        return
+
+    # batch 24 — /portal: portal mágico (entrada o salida) sobre el avatar del que lo escribe. Solo avatares mágicos;
+    # se valida con el avatar de la SESIÓN (nunca el del payload). El modo se reduce a "in" | "out".
+    elif cmd_type == "portal":
+        avatar = user.get("avatarId")
+        if avatar not in PORTAL_AVATARS:
+            emit("system_msg", {"text": "🌀 /portal es solo para avatares mágicos (mago, bruja, hechicera, arcángel, hada…)."})
+            return
+        mode = "out" if str(data.get("mode", "")).lower() == "out" else "in"
+        payload.update({"nick": actor, "avatar": avatar, "mode": mode})
+
+    # batch 25 — Casa: abrir una puerta. Sala = la de la SESIÓN (ya validada por ROOM_EXCLUSIVE_COMMANDS);
+    # del payload solo se lee el destino, que debe estar permitido desde la escena vigente. Si no, se ignora.
+    elif cmd_type == "casa_door":
+        to  = _sanitise(data.get("to", ""), max_len=16)
+        now = time.time()
+        with _casa_lock:
+            st  = _casa.setdefault(room, {"scene": CASA_START, "last": 0.0})
+            cur = st["scene"]
+            if to not in CASA_LINKS.get(cur, ()):
+                return                                           # destino no permitido desde acá: se ignora
+            if now - st["last"] < CASA_COOLDOWN:
+                return                                           # enfriamiento de 3 s por sala: se ignora
+            st["scene"], st["last"] = to, now
+        payload.update({"nick": actor, "fromScene": cur, "toScene": to})
+
+    # batch 23 — /gatocallejero: límites, borde de entrada y lugar de siesta los decide el servidor.
+    elif cmd_type == "gatocallejero":
+        with _gato_lock:
+            bucket = _gatos.setdefault(room, {})
+            now = time.time()
+            for gid in [k for k, g in bucket.items() if g["expires"] <= now]:   # (safety net; the timer normally did it)
+                bucket.pop(gid, None)
+            if any(g["owner_sid"] == sid for g in bucket.values()):
+                emit("system_msg", {"text": "🐈 Ya tenés un gato callejero dando vueltas. Esperá a que se vaya."})
+                return
+            if len(bucket) >= GATO_MAX_PER_ROOM:
+                emit("system_msg", {"text": f"🐈 Ya hay {GATO_MAX_PER_ROOM} gatos en la sala. Esperá a que se vaya alguno."})
+                return
+            gato_id = uuid.uuid4().hex[:8]
+            bucket[gato_id] = {"id": gato_id, "owner": actor, "owner_sid": sid, "expires": now + GATO_TTL_SECS}
+        socketio.start_background_task(_gato_expire_task, room, gato_id, GATO_TTL_SECS)
+        payload.update({"id": gato_id, "owner": actor, "ttl": GATO_TTL_SECS * 1000,
+                        "edge": random.choice(("left", "right")),            # borde de entrada
+                        "nap": random.randint(8, 92)})                       # % horizontal preferido para la siesta
 
     socketio.emit("room_command", payload, to=room)
     print(f"[room_command] {cmd_type} by {payload['fromNick']} in #{room}")   # (no URLs in the log)
@@ -1939,6 +2428,18 @@ def _unique_nick(room: str, desired: str, sid: str, trusted_bot: bool) -> str:
     return candidate
 
 
+def _resolve_nick_in_room(room: str, raw) -> "str | None":
+    """Nick con su capitalización real si hay alguien con ese nick en la sala; si no, None."""
+    want = _sanitise(raw, 32).lower()
+    if not want:
+        return None
+    with _users_lock:
+        for u in online_users.values():
+            if u.get("room") == room and u["nick"].lower() == want:
+                return u["nick"]
+    return None
+
+
 def _release_event(room: str, nick: str) -> None:
     """If *nick* started the room's Event Mode, clear it and tell the room —
     otherwise the red banner would stay up forever after the initiator leaves."""
@@ -1947,6 +2448,280 @@ def _release_event(room: str, nick: str) -> None:
             return
         _active_events.pop(room, None)
     socketio.emit("global_event_mode", {"nick": nick, "room": room, "active": False}, to=room)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /npc — NPC temporales de sala
+# ─────────────────────────────────────────────────────────────────────────────
+NPC_TTL_SECS        = 30      # vida de cada NPC (la vence el servidor)
+NPC_MAX_PER_ROOM    = 4       # NPC activos a la vez por sala
+NPC_CLICK_COOLDOWN  = 5.0     # segundos mínimos entre dos clicks del MISMO NPC
+NPC_OWN_P           = 0.60    # prob. de que la frase salga del banco propio del avatar (si no, del compartido)
+
+# room -> { npc_id: {"id", "owner", "owner_sid", "avatar", "expires", "used": set[str],
+#                    "last_text": str|None, "last_click": float} }
+_npcs: dict = {}
+_npc_lock = threading.Lock()
+
+
+def _npc_ttl_ms(npc: dict) -> int:
+    return max(0, int((npc["expires"] - time.time()) * 1000))
+
+
+def _npc_snapshot(room: str) -> list:
+    """NPC activos de la sala, listos para mandar a un cliente (late joiners)."""
+    now = time.time()
+    with _npc_lock:
+        return [{"id": n["id"], "avatarId": n["avatar"], "owner": n["owner"], "ttl": _npc_ttl_ms(n)}
+                for n in _npcs.get(room, {}).values() if n["expires"] > now]
+
+
+def _npc_pick_line(npc: dict) -> tuple:
+    """Frase nueva para un click: 60 % banco propio / 40 % compartido; nunca la misma dos veces
+    seguidas; sin repetir mientras queden sin usar; si se agotan todas, se reinicia 'usadas'.
+    Caller holds _npc_lock."""
+    own, shared = list(NPC_OWN_LINES[npc["avatar"]]), list(NPC_SHARED_LINES)
+    first, second = (own, shared) if random.random() < NPC_OWN_P else (shared, own)
+    last, used = npc["last_text"], npc["used"]
+    for bank in (first, second):                       # el banco sorteado primero; si no le quedan, el otro
+        fresh = [l for l in bank if l[0] not in used and l[0] != last]
+        if fresh:
+            return random.choice(fresh)
+    used.clear()                                       # se agotaron todas: empieza otra ronda
+    bank = [l for l in first if l[0] != last] or first
+    return random.choice(bank)
+
+
+def _npc_end_emit(room: str, npc_id: str, reason: str) -> None:
+    socketio.emit("room_command", {"type": "npc_end", "room": room, "id": npc_id, "reason": reason}, to=room)
+
+
+def _npc_expire_task(room: str, npc_id: str, delay: float) -> None:
+    """Vence un NPC a los NPC_TTL_SECS (si todavía existe)."""
+    socketio.sleep(delay)
+    with _npc_lock:
+        npc = _npcs.get(room, {}).get(npc_id)
+        if npc is None:
+            return                                     # ya se fue (dueño, sala vacía…)
+        _npcs[room].pop(npc_id, None)
+        if not _npcs[room]:
+            _npcs.pop(room, None)
+    _npc_end_emit(room, npc_id, "expired")
+
+
+def _npc_release(room, sid: str) -> None:
+    """El usuario `sid` deja `room` (o se desconecta): sus NPC se van; y si la sala quedó vacía,
+    se olvidan todos los de la sala. Se llama con el usuario ya fuera de la sala."""
+    if not room:
+        return
+    gone = []
+    with _npc_lock:
+        bucket = _npcs.get(room, {})
+        for nid in [k for k, n in bucket.items() if n["owner_sid"] == sid]:
+            bucket.pop(nid, None)
+            gone.append(nid)
+        if not bucket:
+            _npcs.pop(room, None)
+    for nid in gone:
+        _npc_end_emit(room, nid, "owner_left")
+    with _users_lock:
+        occupied = any(u.get("room") == room for u in online_users.values())
+    if not occupied:
+        with _npc_lock:
+            _npcs.pop(room, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /mando — control remoto de sala (un botón; cualquiera lo aprieta; el servidor elige la víctima)
+# ─────────────────────────────────────────────────────────────────────────────
+MANDO_TTL_SECS      = 60      # vida de cada mando (la vence el servidor)
+MANDO_MAX_PER_ROOM  = 2       # mandos activos a la vez por sala (y 1 por usuario)
+MANDO_COOLDOWN      = 8.0     # segundos mínimos entre dos apretadas del MISMO mando
+
+# room -> { mando_id: {"id", "owner", "owner_sid", "expires", "last_press"} }
+_mandos: dict = {}
+_mando_lock = threading.Lock()
+
+
+def _mando_snapshot(room: str) -> list:
+    """Mandos activos de la sala, listos para mandar a un cliente (late joiners)."""
+    now = time.time()
+    with _mando_lock:
+        return [{"id": m["id"], "owner": m["owner"], "ttl": max(0, int((m["expires"] - now) * 1000))}
+                for m in _mandos.get(room, {}).values() if m["expires"] > now]
+
+
+def _mando_end_emit(room: str, mando_id: str, reason: str) -> None:
+    socketio.emit("room_command", {"type": "mando_end", "room": room, "id": mando_id, "reason": reason}, to=room)
+
+
+def _mando_expire_task(room: str, mando_id: str, delay: float) -> None:
+    """Vence un mando a los MANDO_TTL_SECS (si todavía existe)."""
+    socketio.sleep(delay)
+    with _mando_lock:
+        m = _mandos.get(room, {}).get(mando_id)
+        if m is None:
+            return                                     # ya se fue (dueño, sala vacía…)
+        _mandos[room].pop(mando_id, None)
+        if not _mandos[room]:
+            _mandos.pop(room, None)
+    _mando_end_emit(room, mando_id, "expired")
+
+
+def _mando_release(room, sid: str) -> None:
+    """El usuario `sid` deja `room` (o se desconecta): sus mandos se van; y si la sala quedó vacía,
+    se olvidan todos. Se llama con el usuario ya fuera de la sala."""
+    if not room:
+        return
+    gone = []
+    with _mando_lock:
+        bucket = _mandos.get(room, {})
+        for mid in [k for k, m in bucket.items() if m["owner_sid"] == sid]:
+            bucket.pop(mid, None)
+            gone.append(mid)
+        if not bucket:
+            _mandos.pop(room, None)
+    for mid in gone:
+        _mando_end_emit(room, mid, "owner_left")
+    with _users_lock:
+        occupied = any(u.get("room") == room for u in online_users.values())
+    if not occupied:
+        with _mando_lock:
+            _mandos.pop(room, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Laboratorio — consola con 6 botones (js/laboratory.js). Toda la tabla vive acá; el cliente solo dibuja.
+# ─────────────────────────────────────────────────────────────────────────────
+LAB_ROOM            = "Laboratorio"
+LAB_GLOBAL_COOLDOWN = 3.0     # s entre dos botones cualesquiera de la sala
+# id -> alcance ("one" = una persona al azar de la sala, "all" = toda la sala) y enfriamiento en s
+LAB_BUTTONS = {
+    "discharge": {"scope": "one", "cooldown": 10.0},
+    "freeze":    {"scope": "one", "cooldown": 10.0},
+    "shrink":    {"scope": "one", "cooldown": 10.0},
+    "hologram":  {"scope": "one", "cooldown": 10.0},
+    "gas":       {"scope": "all", "cooldown": 15.0},
+    "alarm":     {"scope": "all", "cooldown": 30.0},
+}
+
+# room -> {"ready": {btn_id: timestamp disponible}, "global": timestamp, "last": {"nick", "id", "ts"} | None}
+_lab: dict = {}
+_lab_lock = threading.Lock()
+
+
+def _lab_snapshot(room: str) -> dict:
+    """Estado para los clientes: milisegundos RESTANTES (nunca marcas de tiempo absolutas)."""
+    now = time.time()
+    with _lab_lock:
+        st = _lab.get(room)
+        cd, glob, last = {}, 0, None
+        if st:
+            cd   = {b: int((t - now) * 1000) for b, t in st["ready"].items() if t > now}
+            glob = max(0, int((st["global"] - now) * 1000))
+            if st["last"]:
+                last = {"nick": st["last"]["nick"], "id": st["last"]["id"],
+                        "agoMs": max(0, int((now - st["last"]["ts"]) * 1000))}
+    return {"cd": cd, "global": glob, "last": last}
+
+
+def _lab_clear_if_empty(room) -> None:
+    """Sala vacía → se olvida el estado de la consola (ya con el usuario fuera de online_users)."""
+    if not room:
+        return
+    with _users_lock:
+        occupied = any(u.get("room") == room for u in online_users.values())
+    if not occupied:
+        with _lab_lock:
+            _lab.pop(room, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Casa — 3 habitaciones (living, cocina, dormitorio) que comparten sala (js/casa.js)
+# ─────────────────────────────────────────────────────────────────────────────
+CASA_ROOM     = "Casa"
+CASA_START    = "living"
+CASA_COOLDOWN = 3.0     # s entre dos cambios de escena en la sala; un click antes de tiempo se ignora
+# Puertas permitidas desde cada escena: mantener sincronizado con casa.js (tabla SCENES)
+CASA_LINKS = {
+    "living":     ("cocina", "dormitorio"),
+    "cocina":     ("living",),
+    "dormitorio": ("living",),
+}
+
+# room -> {"scene": str, "last": timestamp del último cambio}
+_casa: dict = {}
+_casa_lock = threading.Lock()
+
+
+def _casa_scene(room: str) -> str:
+    """Escena vigente de la sala (living si todavía no se abrió ninguna puerta)."""
+    with _casa_lock:
+        return _casa.get(room, {}).get("scene", CASA_START)
+
+
+def _casa_clear_if_empty(room) -> None:
+    """Sala vacía → la escena vuelve a living (ya con el usuario fuera de online_users)."""
+    if not room:
+        return
+    with _users_lock:
+        occupied = any(u.get("room") == room for u in online_users.values())
+    if not occupied:
+        with _casa_lock:
+            _casa.pop(room, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /gatocallejero — gato que cruza un panel y se duerme (efecto corto: sin estado para los que entran tarde)
+# ─────────────────────────────────────────────────────────────────────────────
+# /portal — avatares "mágicos" que pueden abrir un portal (el cliente tiene la paleta de cada uno)
+PORTAL_AVATARS = frozenset({"wizard", "witch", "sorceress", "archangel", "fairy", "darkfairy", "cultistmagic"})
+
+GATO_TTL_SECS     = 70      # vida máxima de cada gato (la vence el servidor)
+GATO_MAX_PER_ROOM = 2       # gatos a la vez por sala (y 1 por usuario)
+
+# room -> { gato_id: {"id", "owner", "owner_sid", "expires"} }
+_gatos: dict = {}
+_gato_lock = threading.Lock()
+
+
+def _gato_end_emit(room: str, gato_id: str, reason: str) -> None:
+    socketio.emit("room_command", {"type": "gato_end", "room": room, "id": gato_id, "reason": reason}, to=room)
+
+
+def _gato_expire_task(room: str, gato_id: str, delay: float) -> None:
+    """Da por terminado el gato a los GATO_TTL_SECS (si todavía existe)."""
+    socketio.sleep(delay)
+    with _gato_lock:
+        g = _gatos.get(room, {}).get(gato_id)
+        if g is None:
+            return                                     # ya se fue (dueño, sala vacía…)
+        _gatos[room].pop(gato_id, None)
+        if not _gatos[room]:
+            _gatos.pop(room, None)
+    _gato_end_emit(room, gato_id, "expired")
+
+
+def _gato_release(room, sid: str) -> None:
+    """El usuario `sid` deja `room` (o se desconecta): su gato se va; y si la sala quedó vacía,
+    se olvidan todos. Se llama con el usuario ya fuera de la sala."""
+    if not room:
+        return
+    gone = []
+    with _gato_lock:
+        bucket = _gatos.get(room, {})
+        for gid in [k for k, g in bucket.items() if g["owner_sid"] == sid]:
+            bucket.pop(gid, None)
+            gone.append(gid)
+        if not bucket:
+            _gatos.pop(room, None)
+    for gid in gone:
+        _gato_end_emit(room, gid, "owner_left")
+    with _users_lock:
+        occupied = any(u.get("room") == room for u in online_users.values())
+    if not occupied:
+        with _gato_lock:
+            _gatos.pop(room, None)
 
 
 def _room_counts() -> dict:
